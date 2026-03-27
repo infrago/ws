@@ -12,6 +12,7 @@ type (
 		Conn    Conn
 
 		Op      string
+		Space   string
 		Type    int
 		Name    string
 		Message Message
@@ -142,42 +143,42 @@ func (ctx *Context) PushUser(uid, msg string, values ...Map) error {
 	if ctx == nil {
 		return PushUser(uid, msg, values...)
 	}
-	return module.pushUser(ctx.Meta, uid, msg, pickMap(values...))
+	return module.pushUser(ctx.Meta, ctx.Space, uid, msg, pickMap(values...))
 }
 
 func (ctx *Context) PushUserResult(uid, msg string, values ...Map) Delivery {
 	if ctx == nil {
 		return PushUserResult(uid, msg, values...)
 	}
-	return module.deliverUser(ctx.Meta, uid, msg, pickMap(values...))
+	return module.deliverUser(ctx.Meta, ctx.Space, uid, msg, pickMap(values...))
 }
 
 func (ctx *Context) Broadcast(msg string, values ...Map) error {
 	if ctx == nil {
 		return Broadcast(msg, values...)
 	}
-	return module.broadcast(ctx.Meta, msg, pickMap(values...))
+	return module.broadcast(ctx.Meta, ctx.Space, msg, pickMap(values...))
 }
 
 func (ctx *Context) BroadcastResult(msg string, values ...Map) Delivery {
 	if ctx == nil {
 		return BroadcastResult(msg, values...)
 	}
-	return module.deliverBroadcast(ctx.Meta, msg, pickMap(values...))
+	return module.deliverBroadcast(ctx.Meta, ctx.Space, msg, pickMap(values...))
 }
 
 func (ctx *Context) Groupcast(gid, msg string, values ...Map) error {
 	if ctx == nil {
 		return Groupcast(gid, msg, values...)
 	}
-	return module.groupcast(ctx.Meta, gid, msg, pickMap(values...))
+	return module.groupcast(ctx.Meta, ctx.Space, gid, msg, pickMap(values...))
 }
 
 func (ctx *Context) GroupcastResult(gid, msg string, values ...Map) Delivery {
 	if ctx == nil {
 		return GroupcastResult(gid, msg, values...)
 	}
-	return module.deliverGroup(ctx.Meta, gid, msg, pickMap(values...))
+	return module.deliverGroup(ctx.Meta, ctx.Space, gid, msg, pickMap(values...))
 }
 
 func (ctx *Context) Join(groups ...string) {

@@ -29,6 +29,9 @@ const (
 	dispatchGroupcast = "groupcast"
 
 	internalDispatch = "_ws.dispatch"
+	exportSchemaVer  = 1
+	frameNameKey     = "name"
+	frameDataKey     = "data"
 )
 
 func init() {
@@ -40,8 +43,6 @@ var (
 		config: Config{
 			Format:         "text",
 			Codec:          infra.JSON,
-			MessageKey:     "name",
-			PayloadKey:     "data",
 			PingInterval:   time.Second * 30,
 			ReadTimeout:    time.Second * 75,
 			WriteTimeout:   time.Second * 10,
@@ -49,14 +50,14 @@ var (
 			QueueSize:      128,
 			QueuePolicy:    "close",
 		},
-		messages: make(map[string]Message),
-		commands: make(map[string]Command),
-		filters:  make(map[string]Filter),
-		handlers: make(map[string]Handler),
-		hooks:    make(map[string]Hook),
+		messages: make(map[string]map[string]Message),
+		commands: make(map[string]map[string]Command),
+		filters:  make(map[string]map[string]Filter),
+		handlers: make(map[string]map[string]Handler),
+		hooks:    make(map[string]map[string]Hook),
 		sessions: make(map[string]*Session),
-		groups:   make(map[string]map[string]*Session),
-		users:    make(map[string]map[string]*Session),
+		groups:   make(map[string]map[string]map[string]*Session),
+		users:    make(map[string]map[string]map[string]*Session),
 	}
 	host           = infra.Mount(module)
 	jsonBufferPool = sync.Pool{
@@ -73,20 +74,20 @@ type (
 		opened bool
 		config Config
 
-		messages map[string]Message
-		commands map[string]Command
-		filters  map[string]Filter
-		handlers map[string]Handler
-		hooks    map[string]Hook
+		messages map[string]map[string]Message
+		commands map[string]map[string]Command
+		filters  map[string]map[string]Filter
+		handlers map[string]map[string]Handler
+		hooks    map[string]map[string]Hook
 
-		filterList  []Filter
-		handlerList []Handler
-		hookList    []Hook
+		filterLists  map[string][]Filter
+		handlerLists map[string][]Handler
+		hookLists    map[string][]Hook
 
 		sessionMutex sync.RWMutex
 		sessions     map[string]*Session
-		groups       map[string]map[string]*Session
-		users        map[string]map[string]*Session
+		groups       map[string]map[string]map[string]*Session
+		users        map[string]map[string]map[string]*Session
 
 		stats       wsStats
 		observeStop chan struct{}
@@ -94,6 +95,7 @@ type (
 
 	Hooks map[string]Hook
 	Hook  struct {
+		Space   string  `json:"space,omitempty"`
 		Name    string  `json:"name"`
 		Desc    string  `json:"desc"`
 		Open    ctxFunc `json:"-"`
@@ -103,12 +105,14 @@ type (
 	}
 	Filters map[string]Filter
 	Filter  struct {
+		Space   string  `json:"space,omitempty"`
 		Name    string  `json:"name"`
 		Desc    string  `json:"desc"`
 		Message ctxFunc `json:"-"`
 	}
 	Handlers map[string]Handler
 	Handler  struct {
+		Space   string  `json:"space,omitempty"`
 		Name    string  `json:"name"`
 		Desc    string  `json:"desc"`
 		Error   ctxFunc `json:"-"`
@@ -117,6 +121,7 @@ type (
 	}
 	Messages map[string]Message
 	Message  struct {
+		Space    string  `json:"space,omitempty"`
 		Name     string  `json:"name"`
 		Desc     string  `json:"desc"`
 		Nullable bool    `json:"nullable"`
@@ -126,6 +131,7 @@ type (
 	}
 	Commands map[string]Command
 	Command  struct {
+		Space    string `json:"space,omitempty"`
 		Name     string `json:"name"`
 		Desc     string `json:"desc"`
 		Nullable bool   `json:"nullable"`
@@ -143,8 +149,6 @@ type (
 	Config struct {
 		Format          string        `json:"format"`
 		Codec           string        `json:"codec"`
-		MessageKey      string        `json:"message_key"`
-		PayloadKey      string        `json:"payload_key"`
 		PingInterval    time.Duration `json:"ping_interval"`
 		ReadTimeout     time.Duration `json:"read_timeout"`
 		WriteTimeout    time.Duration `json:"write_timeout"`
@@ -184,6 +188,7 @@ type (
 	AcceptOptions struct {
 		Conn       Conn
 		Meta       *infra.Meta
+		Space      string
 		Name       string
 		Site       string
 		Host       string
@@ -202,6 +207,7 @@ type (
 
 	Session struct {
 		ID         string         `json:"id"`
+		Space      string         `json:"space"`
 		User       string         `json:"user,omitempty"`
 		Name       string         `json:"name"`
 		Site       string         `json:"site,omitempty"`
@@ -235,12 +241,13 @@ type (
 	}
 
 	dispatchEnvelope struct {
-		Op   string `json:"op"`
-		Sid  string `json:"sid,omitempty"`
-		Uid  string `json:"uid,omitempty"`
-		Gid  string `json:"gid,omitempty"`
-		Msg  string `json:"msg"`
-		Args Map    `json:"args,omitempty"`
+		Op    string `json:"op"`
+		Space string `json:"space,omitempty"`
+		Sid   string `json:"sid,omitempty"`
+		Uid   string `json:"uid,omitempty"`
+		Gid   string `json:"gid,omitempty"`
+		Msg   string `json:"msg"`
+		Args  Map    `json:"args,omitempty"`
 	}
 
 	preparedFrame struct {
@@ -310,12 +317,6 @@ func (m *Module) Config(global Map) {
 	if cfg.Codec == "" {
 		cfg.Codec = infra.JSON
 	}
-	if cfg.MessageKey == "" {
-		cfg.MessageKey = "name"
-	}
-	if cfg.PayloadKey == "" {
-		cfg.PayloadKey = "data"
-	}
 	if cfg.PingInterval <= 0 {
 		cfg.PingInterval = time.Second * 30
 	}
@@ -341,12 +342,6 @@ func (m *Module) Config(global Map) {
 		}
 		if codec, ok := raw["codec"].(string); ok {
 			cfg.Codec = strings.TrimSpace(strings.ToLower(codec))
-		}
-		if key, ok := raw["message_key"].(string); ok {
-			cfg.MessageKey = strings.TrimSpace(strings.ToLower(key))
-		}
-		if key, ok := raw["payload_key"].(string); ok {
-			cfg.PayloadKey = strings.TrimSpace(strings.ToLower(key))
 		}
 		if value, ok := parseDuration(raw["ping_interval"]); ok {
 			cfg.PingInterval = value
@@ -396,9 +391,9 @@ func (m *Module) Open() {
 	defer m.mutex.Unlock()
 	m.opened = true
 	m.config = normalizeConfig(m.config)
-	m.filterList = orderedValues(m.filters)
-	m.handlerList = orderedValues(m.handlers)
-	m.hookList = orderedValues(m.hooks)
+	m.filterLists = orderedSpaceValues(m.filters)
+	m.handlerLists = orderedSpaceValues(m.handlers)
+	m.hookLists = orderedSpaceValues(m.hooks)
 }
 
 func (m *Module) Start() {
@@ -429,7 +424,9 @@ func (m *Module) RegisterHook(name string, hook Hook) {
 	if hook.Open == nil && hook.Close == nil && hook.Receive == nil && hook.Send == nil {
 		return
 	}
-	storeNamed(m.hooks, name, hook)
+	space := normalizeSpace(hook.Space)
+	hook.Space = space
+	storeSpaceNamed(m.hooks, space, name, hook)
 }
 
 func (m *Module) RegisterHooks(items Hooks) {
@@ -449,7 +446,9 @@ func (m *Module) RegisterFilter(name string, filter Filter) {
 	if name == "" || filter.Message == nil {
 		return
 	}
-	storeNamed(m.filters, name, filter)
+	space := normalizeSpace(filter.Space)
+	filter.Space = space
+	storeSpaceNamed(m.filters, space, name, filter)
 }
 
 func (m *Module) RegisterFilters(items Filters) {
@@ -472,7 +471,9 @@ func (m *Module) RegisterHandler(name string, handler Handler) {
 	if handler.Error == nil && handler.Invalid == nil && handler.Denied == nil {
 		return
 	}
-	storeNamed(m.handlers, name, handler)
+	space := normalizeSpace(handler.Space)
+	handler.Space = space
+	storeSpaceNamed(m.handlers, space, name, handler)
 }
 
 func (m *Module) RegisterHandlers(items Handlers) {
@@ -492,8 +493,10 @@ func (m *Module) RegisterMessage(name string, message Message) {
 	if name == "" || message.Action == nil {
 		return
 	}
+	space := normalizeSpace(message.Space)
+	message.Space = space
 	message.Name = pickString(message.Name, name)
-	storeNamed(m.messages, name, message)
+	storeSpaceNamed(m.messages, space, name, message)
 }
 
 func (m *Module) RegisterMessages(prefix string, items Messages) {
@@ -517,8 +520,10 @@ func (m *Module) RegisterCommand(name string, command Command) {
 	if name == "" {
 		return
 	}
+	space := normalizeSpace(command.Space)
+	command.Space = space
 	command.Name = pickString(command.Name, name)
-	storeNamed(m.commands, name, command)
+	storeSpaceNamed(m.commands, space, name, command)
 }
 
 func (m *Module) RegisterCommands(prefix string, items Commands) {
@@ -536,8 +541,11 @@ func Accept(opts AcceptOptions) error {
 		return errors.New("invalid websocket connection")
 	}
 
+	space := normalizeSpace(pickString(opts.Space, opts.Name, infra.DEFAULT))
+
 	session := &Session{
 		ID:         infra.GenerateTokenID(),
+		Space:      space,
 		User:       inferUserID(opts.Meta, opts.Args, opts.Value),
 		Name:       strings.TrimSpace(strings.ToLower(opts.Name)),
 		Site:       strings.TrimSpace(strings.ToLower(opts.Site)),
@@ -616,27 +624,51 @@ func PushResult(sid, msg string, values ...Map) Delivery {
 }
 
 func PushUser(uid, msg string, values ...Map) error {
-	return module.pushUser(nil, uid, msg, pickMap(values...))
+	return module.pushUser(nil, infra.DEFAULT, uid, msg, pickMap(values...))
+}
+
+func PushUserIn(space, uid, msg string, values ...Map) error {
+	return module.pushUser(nil, space, uid, msg, pickMap(values...))
 }
 
 func PushUserResult(uid, msg string, values ...Map) Delivery {
-	return module.deliverUser(nil, uid, msg, pickMap(values...))
+	return module.deliverUser(nil, infra.DEFAULT, uid, msg, pickMap(values...))
+}
+
+func PushUserResultIn(space, uid, msg string, values ...Map) Delivery {
+	return module.deliverUser(nil, space, uid, msg, pickMap(values...))
 }
 
 func Broadcast(msg string, values ...Map) error {
-	return module.broadcast(nil, msg, pickMap(values...))
+	return module.broadcast(nil, infra.DEFAULT, msg, pickMap(values...))
+}
+
+func BroadcastIn(space, msg string, values ...Map) error {
+	return module.broadcast(nil, space, msg, pickMap(values...))
 }
 
 func BroadcastResult(msg string, values ...Map) Delivery {
-	return module.deliverBroadcast(nil, msg, pickMap(values...))
+	return module.deliverBroadcast(nil, infra.DEFAULT, msg, pickMap(values...))
+}
+
+func BroadcastResultIn(space, msg string, values ...Map) Delivery {
+	return module.deliverBroadcast(nil, space, msg, pickMap(values...))
 }
 
 func Groupcast(gid, msg string, values ...Map) error {
-	return module.groupcast(nil, gid, msg, pickMap(values...))
+	return module.groupcast(nil, infra.DEFAULT, gid, msg, pickMap(values...))
+}
+
+func GroupcastIn(space, gid, msg string, values ...Map) error {
+	return module.groupcast(nil, space, gid, msg, pickMap(values...))
 }
 
 func GroupcastResult(gid, msg string, values ...Map) Delivery {
-	return module.deliverGroup(nil, gid, msg, pickMap(values...))
+	return module.deliverGroup(nil, infra.DEFAULT, gid, msg, pickMap(values...))
+}
+
+func GroupcastResultIn(space, gid, msg string, values ...Map) Delivery {
+	return module.deliverGroup(nil, space, gid, msg, pickMap(values...))
 }
 
 func SessionByID(id string) *Session {
@@ -648,7 +680,11 @@ func Sessions() []*Session {
 }
 
 func SessionsByUser(uid string) []*Session {
-	return module.userSessions(uid)
+	return module.userSessions(infra.DEFAULT, uid)
+}
+
+func SessionsByUserIn(space, uid string) []*Session {
+	return module.userSessions(space, uid)
 }
 
 func Export() Map {
@@ -689,7 +725,8 @@ func (m *Module) push(meta *infra.Meta, sid, msg string, value Map) error {
 	})
 }
 
-func (m *Module) pushUser(meta *infra.Meta, uid, msg string, value Map) error {
+func (m *Module) pushUser(meta *infra.Meta, space, uid, msg string, value Map) error {
+	space = normalizeSpace(space)
 	uid = strings.TrimSpace(uid)
 	msg = strings.TrimSpace(strings.ToLower(msg))
 	if uid == "" || msg == "" {
@@ -697,40 +734,46 @@ func (m *Module) pushUser(meta *infra.Meta, uid, msg string, value Map) error {
 	}
 	if meta != nil {
 		return meta.Broadcast(internalDispatch, Map{
-			"op":   dispatchPushUser,
-			"uid":  uid,
-			"msg":  msg,
-			"args": cloneMap(value),
+			"op":    dispatchPushUser,
+			"space": space,
+			"uid":   uid,
+			"msg":   msg,
+			"args":  cloneMap(value),
 		})
 	}
 	return infra.Broadcast(internalDispatch, Map{
-		"op":   dispatchPushUser,
-		"uid":  uid,
-		"msg":  msg,
-		"args": cloneMap(value),
+		"op":    dispatchPushUser,
+		"space": space,
+		"uid":   uid,
+		"msg":   msg,
+		"args":  cloneMap(value),
 	})
 }
 
-func (m *Module) broadcast(meta *infra.Meta, msg string, value Map) error {
+func (m *Module) broadcast(meta *infra.Meta, space, msg string, value Map) error {
+	space = normalizeSpace(space)
 	msg = strings.TrimSpace(strings.ToLower(msg))
 	if msg == "" {
 		return errors.New("invalid ws broadcast message")
 	}
 	if meta != nil {
 		return meta.Broadcast(internalDispatch, Map{
-			"op":   dispatchBroadcast,
-			"msg":  msg,
-			"args": cloneMap(value),
+			"op":    dispatchBroadcast,
+			"space": space,
+			"msg":   msg,
+			"args":  cloneMap(value),
 		})
 	}
 	return infra.Broadcast(internalDispatch, Map{
-		"op":   dispatchBroadcast,
-		"msg":  msg,
-		"args": cloneMap(value),
+		"op":    dispatchBroadcast,
+		"space": space,
+		"msg":   msg,
+		"args":  cloneMap(value),
 	})
 }
 
-func (m *Module) groupcast(meta *infra.Meta, gid, msg string, value Map) error {
+func (m *Module) groupcast(meta *infra.Meta, space, gid, msg string, value Map) error {
+	space = normalizeSpace(space)
 	gid = strings.TrimSpace(gid)
 	msg = strings.TrimSpace(strings.ToLower(msg))
 	if gid == "" || msg == "" {
@@ -738,17 +781,19 @@ func (m *Module) groupcast(meta *infra.Meta, gid, msg string, value Map) error {
 	}
 	if meta != nil {
 		return meta.Broadcast(internalDispatch, Map{
-			"op":   dispatchGroupcast,
-			"gid":  gid,
-			"msg":  msg,
-			"args": cloneMap(value),
+			"op":    dispatchGroupcast,
+			"space": space,
+			"gid":   gid,
+			"msg":   msg,
+			"args":  cloneMap(value),
 		})
 	}
 	return infra.Broadcast(internalDispatch, Map{
-		"op":   dispatchGroupcast,
-		"gid":  gid,
-		"msg":  msg,
-		"args": cloneMap(value),
+		"op":    dispatchGroupcast,
+		"space": space,
+		"gid":   gid,
+		"msg":   msg,
+		"args":  cloneMap(value),
 	})
 }
 
@@ -759,6 +804,7 @@ func (m *Module) newContext(session *Session, op string) *Context {
 		Session: session,
 		Conn:    session.Conn,
 		Op:      op,
+		Space:   session.Space,
 		Setting: cloneMap(session.Setting),
 		Value:   cloneMap(session.Value),
 		Args:    cloneMap(session.Args),
@@ -791,7 +837,7 @@ func (m *Module) handlePayload(session *Session, messageType int, payload []byte
 		raw = Map{}
 	}
 
-	cfg, ok := m.message(name)
+	cfg, ok := m.message(session.Space, name)
 	if !ok {
 		ctx := m.newContext(session, opMessage)
 		ctx.Name = name
@@ -821,7 +867,7 @@ func (m *Module) handlePayload(session *Session, messageType int, payload []byte
 		ctx.Args = args
 	}
 
-	ctx.next(m.filterChain()...)
+	ctx.next(m.filterChain(session.Space)...)
 	ctx.next(cfg.Action)
 
 	func() {
@@ -843,7 +889,7 @@ func (m *Module) handle(ctx *Context) {
 		return
 	}
 
-	for _, handler := range m.handlerChain() {
+	for _, handler := range m.handlerChain(ctx.Space) {
 		switch ctx.handling {
 		case "invalid":
 			if handler.Invalid != nil {
@@ -874,20 +920,20 @@ func (m *Module) deliverSession(meta *infra.Meta, sid, msg string, value Map) De
 	return m.deliverPrepared(session, m.prepareFrame(meta, session, msg, value, nil))
 }
 
-func (m *Module) deliverUser(meta *infra.Meta, uid, msg string, value Map) Delivery {
+func (m *Module) deliverUser(meta *infra.Meta, space, uid, msg string, value Map) Delivery {
 	result := Delivery{}
-	for _, session := range m.userSessions(uid) {
+	for _, session := range m.userSessions(space, uid) {
 		result.merge(m.deliverPrepared(session, m.prepareFrame(meta, session, msg, value, nil)))
 	}
 	return result
 }
 
-func (m *Module) deliverBroadcast(meta *infra.Meta, msg string, value Map) Delivery {
-	return m.deliverMany(meta, m.sessionsSnapshot(), msg, value)
+func (m *Module) deliverBroadcast(meta *infra.Meta, space, msg string, value Map) Delivery {
+	return m.deliverMany(meta, m.sessionsSnapshot(space), msg, value)
 }
 
-func (m *Module) deliverGroup(meta *infra.Meta, gid, msg string, value Map) Delivery {
-	return m.deliverMany(meta, m.groupSessions(gid), msg, value)
+func (m *Module) deliverGroup(meta *infra.Meta, space, gid, msg string, value Map) Delivery {
+	return m.deliverMany(meta, m.groupSessions(space, gid), msg, value)
 }
 
 func (m *Module) deliverMany(meta *infra.Meta, sessions []*Session, msg string, value Map) Delivery {
@@ -917,9 +963,9 @@ func (m *Module) prepareSharedFrame(meta *infra.Meta, sessions []*Session, msg s
 		return preparedFrame{Name: ""}, true
 	}
 
-	command, ok := m.command(name)
+	first := sessions[0]
+	command, ok := m.command(first.Space, name)
 	if !ok || command.Args == nil || meta != nil {
-		first := sessions[0]
 		return m.prepareFrame(meta, first, msg, value, nil), true
 	}
 	return preparedFrame{}, false
@@ -941,7 +987,7 @@ func (m *Module) prepareFrame(meta *infra.Meta, session *Session, msg string, va
 	}
 
 	args := raw
-	command, ok := m.command(name)
+	command, ok := m.command(session.Space, name)
 	priority := "normal"
 	policy := ""
 	if ok {
@@ -1176,26 +1222,44 @@ func (m *Module) writePrepared(session *Session, prepared preparedFrame) error {
 }
 
 func (m *Module) registerSession(session *Session) {
+	if session == nil {
+		return
+	}
+	session.Space = normalizeSpace(session.Space)
+
 	m.sessionMutex.Lock()
 	defer m.sessionMutex.Unlock()
 	m.sessions[session.ID] = session
 	if uid := strings.TrimSpace(session.User); uid != "" {
-		if _, ok := m.users[uid]; !ok {
-			m.users[uid] = make(map[string]*Session)
+		if _, ok := m.users[session.Space]; !ok {
+			m.users[session.Space] = make(map[string]map[string]*Session)
 		}
-		m.users[uid][session.ID] = session
+		if _, ok := m.users[session.Space][uid]; !ok {
+			m.users[session.Space][uid] = make(map[string]*Session)
+		}
+		m.users[session.Space][uid][session.ID] = session
 	}
 }
 
 func (m *Module) unregisterSession(session *Session) {
+	if session == nil {
+		return
+	}
+	session.Space = normalizeSpace(session.Space)
+
 	m.leaveAll(session)
 
 	m.sessionMutex.Lock()
 	if uid := strings.TrimSpace(session.User); uid != "" {
-		if members, ok := m.users[uid]; ok {
-			delete(members, session.ID)
-			if len(members) == 0 {
-				delete(m.users, uid)
+		if spaceUsers, ok := m.users[session.Space]; ok {
+			if members, ok := spaceUsers[uid]; ok {
+				delete(members, session.ID)
+				if len(members) == 0 {
+					delete(spaceUsers, uid)
+				}
+			}
+			if len(spaceUsers) == 0 {
+				delete(m.users, session.Space)
 			}
 		}
 	}
@@ -1207,15 +1271,21 @@ func (m *Module) leaveAll(session *Session) {
 	if session == nil {
 		return
 	}
+	session.Space = normalizeSpace(session.Space)
 
 	m.sessionMutex.Lock()
 	defer m.sessionMutex.Unlock()
 
 	for gid := range session.Groups {
-		if members, ok := m.groups[gid]; ok {
-			delete(members, session.ID)
-			if len(members) == 0 {
-				delete(m.groups, gid)
+		if spaceGroups, ok := m.groups[session.Space]; ok {
+			if members, ok := spaceGroups[gid]; ok {
+				delete(members, session.ID)
+				if len(members) == 0 {
+					delete(spaceGroups, gid)
+				}
+			}
+			if len(spaceGroups) == 0 {
+				delete(m.groups, session.Space)
 			}
 		}
 		delete(session.Groups, gid)
@@ -1226,6 +1296,7 @@ func (m *Module) join(session *Session, gid string) {
 	if session == nil {
 		return
 	}
+	session.Space = normalizeSpace(session.Space)
 
 	gid = normalizeGroup(gid)
 	if gid == "" {
@@ -1235,10 +1306,13 @@ func (m *Module) join(session *Session, gid string) {
 	m.sessionMutex.Lock()
 	defer m.sessionMutex.Unlock()
 
-	if _, ok := m.groups[gid]; !ok {
-		m.groups[gid] = make(map[string]*Session)
+	if _, ok := m.groups[session.Space]; !ok {
+		m.groups[session.Space] = make(map[string]map[string]*Session)
 	}
-	m.groups[gid][session.ID] = session
+	if _, ok := m.groups[session.Space][gid]; !ok {
+		m.groups[session.Space][gid] = make(map[string]*Session)
+	}
+	m.groups[session.Space][gid][session.ID] = session
 	session.Groups[gid] = true
 }
 
@@ -1246,6 +1320,7 @@ func (m *Module) leave(session *Session, gid string) {
 	if session == nil {
 		return
 	}
+	session.Space = normalizeSpace(session.Space)
 
 	gid = normalizeGroup(gid)
 	if gid == "" {
@@ -1255,10 +1330,15 @@ func (m *Module) leave(session *Session, gid string) {
 	m.sessionMutex.Lock()
 	defer m.sessionMutex.Unlock()
 
-	if members, ok := m.groups[gid]; ok {
-		delete(members, session.ID)
-		if len(members) == 0 {
-			delete(m.groups, gid)
+	if spaceGroups, ok := m.groups[session.Space]; ok {
+		if members, ok := spaceGroups[gid]; ok {
+			delete(members, session.ID)
+			if len(members) == 0 {
+				delete(spaceGroups, gid)
+			}
+		}
+		if len(spaceGroups) == 0 {
+			delete(m.groups, session.Space)
 		}
 	}
 	delete(session.Groups, gid)
@@ -1268,6 +1348,7 @@ func (m *Module) bindUser(session *Session, uid string) {
 	if session == nil {
 		return
 	}
+	session.Space = normalizeSpace(session.Space)
 
 	uid = strings.TrimSpace(uid)
 
@@ -1275,10 +1356,15 @@ func (m *Module) bindUser(session *Session, uid string) {
 	defer m.sessionMutex.Unlock()
 
 	if current := strings.TrimSpace(session.User); current != "" {
-		if members, ok := m.users[current]; ok {
-			delete(members, session.ID)
-			if len(members) == 0 {
-				delete(m.users, current)
+		if spaceUsers, ok := m.users[session.Space]; ok {
+			if members, ok := spaceUsers[current]; ok {
+				delete(members, session.ID)
+				if len(members) == 0 {
+					delete(spaceUsers, current)
+				}
+			}
+			if len(spaceUsers) == 0 {
+				delete(m.users, session.Space)
 			}
 		}
 	}
@@ -1287,10 +1373,13 @@ func (m *Module) bindUser(session *Session, uid string) {
 	if uid == "" {
 		return
 	}
-	if _, ok := m.users[uid]; !ok {
-		m.users[uid] = make(map[string]*Session)
+	if _, ok := m.users[session.Space]; !ok {
+		m.users[session.Space] = make(map[string]map[string]*Session)
 	}
-	m.users[uid][session.ID] = session
+	if _, ok := m.users[session.Space][uid]; !ok {
+		m.users[session.Space][uid] = make(map[string]*Session)
+	}
+	m.users[session.Space][uid][session.ID] = session
 }
 
 func (m *Module) sessionGroups(session *Session) []string {
@@ -1331,7 +1420,8 @@ func (m *Module) sessionByID(id string) *Session {
 	return m.sessions[id]
 }
 
-func (m *Module) userSessions(uid string) []*Session {
+func (m *Module) userSessions(space, uid string) []*Session {
+	space = normalizeSpace(space)
 	uid = strings.TrimSpace(uid)
 	if uid == "" {
 		return nil
@@ -1340,7 +1430,8 @@ func (m *Module) userSessions(uid string) []*Session {
 	m.sessionMutex.RLock()
 	defer m.sessionMutex.RUnlock()
 
-	members := m.users[uid]
+	spaceUsers := m.users[space]
+	members := spaceUsers[uid]
 	out := make([]*Session, 0, len(members))
 	for _, session := range members {
 		out = append(out, session)
@@ -1353,24 +1444,34 @@ func (m *Module) userSnapshot() []string {
 	defer m.sessionMutex.RUnlock()
 
 	out := make([]string, 0, len(m.users))
-	for uid := range m.users {
-		out = append(out, uid)
+	for _, spaceUsers := range m.users {
+		for uid := range spaceUsers {
+			out = append(out, uid)
+		}
 	}
 	return out
 }
 
-func (m *Module) sessionsSnapshot() []*Session {
+func (m *Module) sessionsSnapshot(space ...string) []*Session {
 	m.sessionMutex.RLock()
 	defer m.sessionMutex.RUnlock()
 
+	targetSpace := ""
+	if len(space) > 0 {
+		targetSpace = normalizeSpace(space[0])
+	}
 	out := make([]*Session, 0, len(m.sessions))
 	for _, session := range m.sessions {
+		if targetSpace != "" && session.Space != targetSpace {
+			continue
+		}
 		out = append(out, session)
 	}
 	return out
 }
 
-func (m *Module) groupSessions(gid string) []*Session {
+func (m *Module) groupSessions(space, gid string) []*Session {
+	space = normalizeSpace(space)
 	gid = normalizeGroup(gid)
 	if gid == "" {
 		return nil
@@ -1379,7 +1480,8 @@ func (m *Module) groupSessions(gid string) []*Session {
 	m.sessionMutex.RLock()
 	defer m.sessionMutex.RUnlock()
 
-	members := m.groups[gid]
+	spaceGroups := m.groups[space]
+	members := spaceGroups[gid]
 	out := make([]*Session, 0, len(members))
 	for _, session := range members {
 		out = append(out, session)
@@ -1387,12 +1489,12 @@ func (m *Module) groupSessions(gid string) []*Session {
 	return out
 }
 
-func (m *Module) filterChain() []ctxFunc {
+func (m *Module) filterChain(space string) []ctxFunc {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	out := make([]ctxFunc, 0, len(m.filterList))
-	for _, filter := range m.filterList {
+	out := make([]ctxFunc, 0)
+	for _, filter := range appendSpaceValues(m.filterLists, space) {
 		if filter.Message != nil {
 			out = append(out, filter.Message)
 		}
@@ -1400,19 +1502,16 @@ func (m *Module) filterChain() []ctxFunc {
 	return out
 }
 
-func (m *Module) handlerChain() []Handler {
+func (m *Module) handlerChain(space string) []Handler {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	out := make([]Handler, len(m.handlerList))
-	copy(out, m.handlerList)
-	return out
+	return pickHandlerValues(m.handlerLists, space)
 }
 
 func (m *Module) callHooks(ctx *Context, pick func(Hook) ctxFunc) {
 	m.mutex.RLock()
-	hooks := make([]Hook, len(m.hookList))
-	copy(hooks, m.hookList)
+	hooks := appendSpaceValues(m.hookLists, ctx.Space)
 	m.mutex.RUnlock()
 
 	for _, hook := range hooks {
@@ -1422,18 +1521,16 @@ func (m *Module) callHooks(ctx *Context, pick func(Hook) ctxFunc) {
 	}
 }
 
-func (m *Module) message(name string) (Message, bool) {
+func (m *Module) message(space, name string) (Message, bool) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
-	cfg, ok := m.messages[strings.TrimSpace(strings.ToLower(name))]
-	return cfg, ok
+	return loadSpaceNamed(m.messages, space, strings.TrimSpace(strings.ToLower(name)))
 }
 
-func (m *Module) command(name string) (Command, bool) {
+func (m *Module) command(space, name string) (Command, bool) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
-	cfg, ok := m.commands[strings.TrimSpace(strings.ToLower(name))]
-	return cfg, ok
+	return loadSpaceNamed(m.commands, space, strings.TrimSpace(strings.ToLower(name)))
 }
 
 func (m *Module) export() Map {
@@ -1441,44 +1538,119 @@ func (m *Module) export() Map {
 	defer m.mutex.RUnlock()
 
 	messages := Map{}
-	for name, item := range m.messages {
-		messages[name] = Map{
-			"name":     item.Name,
-			"desc":     item.Desc,
-			"nullable": item.Nullable,
-			"args":     exportVars(item.Args),
-			"sample": Map{
-				m.frameMessageKey(): name,
-				m.framePayloadKey(): sampleVars(item.Args),
-			},
-			"setting": cloneMap(item.Setting),
+	spaceDocs := Map{}
+	for space, items := range m.messages {
+		spaceItems := Map{}
+		for name, item := range items {
+			request := Map{
+				frameNameKey: name,
+				frameDataKey: sampleVars(item.Args),
+			}
+			response := Map{
+				"code":       0,
+				frameNameKey: name,
+				frameDataKey: Map{"ok": true},
+				"text":       "",
+				"time":       0,
+			}
+			spaceItems[name] = Map{
+				"space":    item.Space,
+				"name":     item.Name,
+				"desc":     item.Desc,
+				"nullable": item.Nullable,
+				"args":     exportVars(item.Args),
+				"sample":   request,
+				"request":  request,
+				"response": response,
+				"setting":  cloneMap(item.Setting),
+			}
 		}
+		messages[space] = spaceItems
+		doc := ensureMap(spaceDocs, space)
+		doc["messages"] = spaceItems
+		doc["message_count"] = len(items)
 	}
 
 	commands := Map{}
-	for name, item := range m.commands {
-		commands[name] = Map{
-			"name":     item.Name,
-			"desc":     item.Desc,
-			"nullable": item.Nullable,
-			"args":     exportVars(item.Args),
-			"sample": Map{
-				"code":              0,
-				m.frameMessageKey(): name,
-				m.framePayloadKey(): sampleVars(item.Args),
-				"time":              0,
-			},
-			"setting": cloneMap(item.Setting),
+	for space, items := range m.commands {
+		spaceItems := Map{}
+		for name, item := range items {
+			response := Map{
+				"code":       0,
+				frameNameKey: name,
+				frameDataKey: sampleVars(item.Args),
+				"text":       "",
+				"time":       0,
+			}
+			spaceItems[name] = Map{
+				"space":    item.Space,
+				"name":     item.Name,
+				"desc":     item.Desc,
+				"nullable": item.Nullable,
+				"args":     exportVars(item.Args),
+				"sample":   response,
+				"response": response,
+				"setting":  cloneMap(item.Setting),
+			}
 		}
+		commands[space] = spaceItems
+		doc := ensureMap(spaceDocs, space)
+		doc["commands"] = spaceItems
+		doc["command_count"] = len(items)
+	}
+
+	for space, items := range m.filters {
+		doc := ensureMap(spaceDocs, space)
+		doc["filter_count"] = len(items)
+	}
+	for space, items := range m.handlers {
+		doc := ensureMap(spaceDocs, space)
+		doc["handler_count"] = len(items)
+	}
+	for space, items := range m.hooks {
+		doc := ensureMap(spaceDocs, space)
+		doc["hook_count"] = len(items)
+	}
+
+	spaces := []Map{}
+	for _, space := range sortedMapKeys(spaceDocs) {
+		doc := ensureMap(spaceDocs, space)
+		doc["space"] = space
+		if _, ok := doc["messages"]; !ok {
+			doc["messages"] = Map{}
+		}
+		if _, ok := doc["commands"]; !ok {
+			doc["commands"] = Map{}
+		}
+		if _, ok := doc["message_count"]; !ok {
+			doc["message_count"] = 0
+		}
+		if _, ok := doc["command_count"]; !ok {
+			doc["command_count"] = 0
+		}
+		if _, ok := doc["filter_count"]; !ok {
+			doc["filter_count"] = 0
+		}
+		if _, ok := doc["handler_count"]; !ok {
+			doc["handler_count"] = 0
+		}
+		if _, ok := doc["hook_count"]; !ok {
+			doc["hook_count"] = 0
+		}
+		spaces = append(spaces, doc)
 	}
 
 	cfg := m.config
 	return Map{
+		"schema": Map{
+			"name":        "infrago.ws.export",
+			"version":     exportSchemaVer,
+			"generated":   time.Now().Unix(),
+			"description": "ws export document schema",
+		},
 		"config": Map{
 			"format":           cfg.Format,
 			"codec":            cfg.Codec,
-			"message_key":      m.frameMessageKey(),
-			"payload_key":      m.framePayloadKey(),
 			"queue_size":       cfg.QueueSize,
 			"queue_policy":     cfg.QueuePolicy,
 			"compression":      cfg.Compression,
@@ -1493,17 +1665,17 @@ func (m *Module) export() Map {
 				"compat_message_keys": []string{"name", "msg"},
 				"compat_payload_keys": []string{"data", "args"},
 				"default": Map{
-					m.frameMessageKey(): "demo.message",
-					m.framePayloadKey(): Map{"field": "value"},
+					frameNameKey: "demo.message",
+					frameDataKey: Map{"field": "value"},
 				},
 			},
 			"response": Map{
 				"default": Map{
-					"code":              0,
-					m.frameMessageKey(): "demo.command",
-					m.framePayloadKey(): Map{"field": "value"},
-					"text":              "失败时才返回",
-					"time":              0,
+					"code":       0,
+					frameNameKey: "demo.command",
+					frameDataKey: Map{"field": "value"},
+					"text":       "失败时才返回",
+					"time":       0,
 				},
 				"fields": Map{
 					"code": "0 表示成功，其它表示失败",
@@ -1513,9 +1685,31 @@ func (m *Module) export() Map {
 			},
 		},
 		"errors":   wsErrorDocs(),
+		"spaces":   spaces,
 		"messages": messages,
 		"commands": commands,
 	}
+}
+
+func ensureMap(parent Map, key string) Map {
+	if parent == nil {
+		return Map{}
+	}
+	if value, ok := parent[key].(Map); ok && value != nil {
+		return value
+	}
+	value := Map{}
+	parent[key] = value
+	return value
+}
+
+func sortedMapKeys(m Map) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (m *Module) metrics() Stats {
@@ -1617,6 +1811,7 @@ func registerInternalMessages() {
 		Desc: "内部消息：ws 节点间分发",
 		Action: func(ctx *infra.Context) Res {
 			op, _ := ctx.Value["op"].(string)
+			space, _ := ctx.Value["space"].(string)
 			sid, _ := ctx.Value["sid"].(string)
 			uid, _ := ctx.Value["uid"].(string)
 			gid, _ := ctx.Value["gid"].(string)
@@ -1627,11 +1822,11 @@ func registerInternalMessages() {
 			case dispatchPush:
 				result = module.deliverSession(ctx.Meta, sid, msg, args)
 			case dispatchPushUser:
-				result = module.deliverUser(ctx.Meta, uid, msg, args)
+				result = module.deliverUser(ctx.Meta, space, uid, msg, args)
 			case dispatchGroupcast:
-				result = module.deliverGroup(ctx.Meta, gid, msg, args)
+				result = module.deliverGroup(ctx.Meta, space, gid, msg, args)
 			default:
-				result = module.deliverBroadcast(ctx.Meta, msg, args)
+				result = module.deliverBroadcast(ctx.Meta, space, msg, args)
 			}
 			if result.FirstError != "" {
 				return infra.Fail.With(result.FirstError)
@@ -1679,14 +1874,6 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.Codec == "" {
 		cfg.Codec = infra.JSON
 	}
-	cfg.MessageKey = strings.TrimSpace(strings.ToLower(cfg.MessageKey))
-	if cfg.MessageKey == "" {
-		cfg.MessageKey = "name"
-	}
-	cfg.PayloadKey = strings.TrimSpace(strings.ToLower(cfg.PayloadKey))
-	if cfg.PayloadKey == "" {
-		cfg.PayloadKey = "data"
-	}
 	if cfg.PingInterval < 0 {
 		cfg.PingInterval = 0
 	}
@@ -1729,6 +1916,14 @@ func normalizeConfig(cfg Config) Config {
 func normalizeName(name, fallback string) string {
 	name = pickString(name, fallback)
 	return strings.TrimSpace(strings.ToLower(name))
+}
+
+func normalizeSpace(space string) string {
+	space = strings.TrimSpace(strings.ToLower(space))
+	if space == "" {
+		return infra.DEFAULT
+	}
+	return space
 }
 
 func normalizeGroup(group string) string {
@@ -1852,9 +2047,9 @@ func (m *Module) buildOutgoingFrame(name string, args Map, code int, text string
 	frame := Map{}
 	frame["code"] = code
 	frame["time"] = time.Now().Unix()
-	frame[m.frameMessageKey()] = name
+	frame[frameNameKey] = name
 	if len(args) > 0 {
-		frame[m.framePayloadKey()] = args
+		frame[frameDataKey] = args
 	}
 	if text != "" {
 		frame["text"] = text
@@ -1867,8 +2062,8 @@ func (m *Module) parseIncomingFrame(frame Map) (string, Map) {
 		return "", Map{}
 	}
 
-	messageKeys := []string{m.frameMessageKey(), "msg", "name"}
-	payloadKeys := []string{m.framePayloadKey(), "args", "data"}
+	messageKeys := []string{frameNameKey, "msg"}
+	payloadKeys := []string{frameDataKey, "args"}
 
 	name := ""
 	for _, key := range messageKeys {
@@ -1913,26 +2108,6 @@ func (m *Module) parseIncomingFrame(frame Map) (string, Map) {
 		args[key] = value
 	}
 	return name, args
-}
-
-func (m *Module) frameMessageKey() string {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	if key := strings.TrimSpace(strings.ToLower(m.config.MessageKey)); key != "" {
-		return key
-	}
-	return "name"
-}
-
-func (m *Module) framePayloadKey() string {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	if key := strings.TrimSpace(strings.ToLower(m.config.PayloadKey)); key != "" {
-		return key
-	}
-	return "data"
 }
 
 func toMap(value Any) Map {
@@ -2149,6 +2324,71 @@ func storeNamed[T any](target map[string]T, name string, value T) {
 	if _, ok := target[name]; !ok {
 		target[name] = value
 	}
+}
+
+func storeSpaceNamed[T any](target map[string]map[string]T, space, name string, value T) {
+	space = normalizeSpace(space)
+	if _, ok := target[space]; !ok {
+		target[space] = make(map[string]T)
+	}
+	storeNamed(target[space], name, value)
+}
+
+func loadSpaceNamed[T any](target map[string]map[string]T, space, name string) (T, bool) {
+	space = normalizeSpace(space)
+	if items, ok := target[space]; ok {
+		if value, ok := items[name]; ok {
+			return value, true
+		}
+	}
+	if space != infra.DEFAULT {
+		if items, ok := target[infra.DEFAULT]; ok {
+			if value, ok := items[name]; ok {
+				return value, true
+			}
+		}
+	}
+	var zero T
+	return zero, false
+}
+
+func orderedSpaceValues[T any](items map[string]map[string]T) map[string][]T {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make(map[string][]T, len(items))
+	for space, values := range items {
+		out[space] = orderedValues(values)
+	}
+	return out
+}
+
+func appendSpaceValues[T any](items map[string][]T, space string) []T {
+	space = normalizeSpace(space)
+	base := items[infra.DEFAULT]
+	if space == infra.DEFAULT {
+		out := make([]T, len(base))
+		copy(out, base)
+		return out
+	}
+	curr := items[space]
+	out := make([]T, 0, len(base)+len(curr))
+	out = append(out, base...)
+	out = append(out, curr...)
+	return out
+}
+
+func pickHandlerValues(items map[string][]Handler, space string) []Handler {
+	space = normalizeSpace(space)
+	if handlers := items[space]; len(handlers) > 0 {
+		out := make([]Handler, len(handlers))
+		copy(out, handlers)
+		return out
+	}
+	handlers := items[infra.DEFAULT]
+	out := make([]Handler, len(handlers))
+	copy(out, handlers)
+	return out
 }
 
 func (m *Module) configureSession(session *Session) {

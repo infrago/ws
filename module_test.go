@@ -76,22 +76,22 @@ func (c *testConn) SetCompressionLevel(level int) error {
 func resetModuleForTest() {
 	module.mutex.Lock()
 	module.opened = false
-	module.config = Config{Format: "text", Codec: infra.JSON, MessageKey: "name", PayloadKey: "data", PingInterval: 30 * time.Second, ReadTimeout: 75 * time.Second, WriteTimeout: 10 * time.Second, MaxMessageSize: 4 << 20, QueueSize: 128, QueuePolicy: "close"}
-	module.messages = make(map[string]Message)
-	module.commands = make(map[string]Command)
-	module.filters = make(map[string]Filter)
-	module.handlers = make(map[string]Handler)
-	module.hooks = make(map[string]Hook)
-	module.filterList = nil
-	module.handlerList = nil
-	module.hookList = nil
+	module.config = Config{Format: "text", Codec: infra.JSON, PingInterval: 30 * time.Second, ReadTimeout: 75 * time.Second, WriteTimeout: 10 * time.Second, MaxMessageSize: 4 << 20, QueueSize: 128, QueuePolicy: "close"}
+	module.messages = make(map[string]map[string]Message)
+	module.commands = make(map[string]map[string]Command)
+	module.filters = make(map[string]map[string]Filter)
+	module.handlers = make(map[string]map[string]Handler)
+	module.hooks = make(map[string]map[string]Hook)
+	module.filterLists = nil
+	module.handlerLists = nil
+	module.hookLists = nil
 	module.stats = wsStats{}
 	module.mutex.Unlock()
 
 	module.sessionMutex.Lock()
 	module.sessions = make(map[string]*Session)
-	module.groups = make(map[string]map[string]*Session)
-	module.users = make(map[string]map[string]*Session)
+	module.groups = make(map[string]map[string]map[string]*Session)
+	module.users = make(map[string]map[string]map[string]*Session)
 	module.sessionMutex.Unlock()
 }
 
@@ -294,7 +294,7 @@ func TestGroupcastLocal(t *testing.T) {
 	module.registerSession(session2)
 	module.join(session1, "room1")
 
-	if result := module.deliverGroup(nil, "room1", "demo.notice", Map{"ok": true}); result.FirstError != "" {
+	if result := module.deliverGroup(nil, infra.DEFAULT, "room1", "demo.notice", Map{"ok": true}); result.FirstError != "" {
 		t.Fatalf("group deliver failed: %v", result.FirstError)
 	}
 
@@ -374,7 +374,7 @@ func TestPushUserDeliversToBoundSessions(t *testing.T) {
 	module.registerSession(session2)
 	module.registerSession(session3)
 
-	if result := module.deliverUser(nil, "u1", "demo.notice", Map{"ok": true}); result.FirstError != "" {
+	if result := module.deliverUser(nil, infra.DEFAULT, "u1", "demo.notice", Map{"ok": true}); result.FirstError != "" {
 		t.Fatalf("push user failed: %v", result.FirstError)
 	}
 
@@ -397,7 +397,7 @@ func TestBroadcastResultCounts(t *testing.T) {
 	module.registerSession(session1)
 	module.registerSession(session2)
 
-	result := module.deliverBroadcast(nil, "demo.notice", Map{"ok": true})
+	result := module.deliverBroadcast(nil, infra.DEFAULT, "demo.notice", Map{"ok": true})
 	if result.Hit != 2 || result.Success != 1 || result.Failed != 1 {
 		t.Fatalf("unexpected delivery result: %#v", result)
 	}
@@ -522,8 +522,15 @@ func TestExportIncludesMessagesAndCommands(t *testing.T) {
 	module.Open()
 
 	doc := Export()
-	messages := anyToMap(doc["messages"])
-	commands := anyToMap(doc["commands"])
+	schema := anyToMap(doc["schema"])
+	if schema["name"] != "infrago.ws.export" || schema["version"] != exportSchemaVer {
+		t.Fatalf("expected export schema metadata: %#v", schema)
+	}
+	if schema["generated"] == nil {
+		t.Fatalf("expected schema generated timestamp: %#v", schema)
+	}
+	messages := anyToMap(anyToMap(doc["messages"])[infra.DEFAULT])
+	commands := anyToMap(anyToMap(doc["commands"])[infra.DEFAULT])
 	if _, ok := messages["demo.echo"]; !ok {
 		t.Fatalf("expected message export")
 	}
@@ -537,5 +544,107 @@ func TestExportIncludesMessagesAndCommands(t *testing.T) {
 	sample := anyToMap(anyToMap(messages["demo.echo"])["sample"])
 	if sample["name"] != "demo.echo" {
 		t.Fatalf("expected message sample export: %#v", sample)
+	}
+	if _, ok := sample["space"]; ok {
+		t.Fatalf("wire sample should not expose internal space: %#v", sample)
+	}
+	spaces, ok := doc["spaces"].([]Map)
+	if !ok || len(spaces) != 1 || spaces[0]["space"] != infra.DEFAULT {
+		t.Fatalf("expected spaces export: %#v", doc["spaces"])
+	}
+	if spaces[0]["message_count"] != 1 || spaces[0]["command_count"] != 1 {
+		t.Fatalf("expected per-space counts: %#v", spaces[0])
+	}
+}
+
+func TestAcceptDefaultsSpaceFromName(t *testing.T) {
+	resetModuleForTest()
+
+	hit := false
+	module.RegisterMessage("demo.echo", Message{
+		Space: "demo.socket",
+		Action: func(ctx *Context) {
+			hit = true
+			if ctx.Space != "demo.socket" || ctx.Session.Space != "demo.socket" {
+				t.Fatalf("unexpected space: ctx=%q session=%q", ctx.Space, ctx.Session.Space)
+			}
+		},
+	})
+	module.Open()
+
+	conn := &testConn{
+		reads: [][]byte{[]byte(`{"name":"demo.echo","data":{}}`)},
+	}
+	if err := Accept(AcceptOptions{
+		Conn: conn,
+		Meta: infra.NewMeta(),
+		Name: "demo.socket",
+	}); err != nil {
+		t.Fatalf("accept failed: %v", err)
+	}
+	if !hit {
+		t.Fatalf("expected space-specific message to be called")
+	}
+}
+
+func TestBroadcastIsolatedBySpace(t *testing.T) {
+	resetModuleForTest()
+	module.Open()
+
+	conn1 := &testConn{}
+	conn2 := &testConn{}
+	session1 := &Session{ID: "s1", Space: "chat", Meta: infra.NewMeta(), Conn: conn1, Groups: map[string]Any{}, closed: make(chan struct{})}
+	session2 := &Session{ID: "s2", Space: "notice", Meta: infra.NewMeta(), Conn: conn2, Groups: map[string]Any{}, closed: make(chan struct{})}
+	module.registerSession(session1)
+	module.registerSession(session2)
+
+	result := module.deliverBroadcast(nil, "chat", "demo.notice", Map{"ok": true})
+	if result.Hit != 1 || result.Success != 1 {
+		t.Fatalf("unexpected broadcast result: %#v", result)
+	}
+	if len(conn1.writes) != 1 || len(conn2.writes) != 0 {
+		t.Fatalf("expected only target space session to receive write")
+	}
+}
+
+func TestFilterChainIncludesGlobalAndSpaceFilters(t *testing.T) {
+	resetModuleForTest()
+
+	order := make([]string, 0, 3)
+	module.RegisterFilter("global", Filter{
+		Message: func(ctx *Context) {
+			order = append(order, "global")
+			ctx.Next()
+		},
+	})
+	module.RegisterFilter("room", Filter{
+		Space: "room",
+		Message: func(ctx *Context) {
+			order = append(order, "room")
+			ctx.Next()
+		},
+	})
+	module.RegisterMessage("demo.echo", Message{
+		Space: "room",
+		Action: func(ctx *Context) {
+			order = append(order, "action")
+		},
+	})
+	module.Open()
+
+	conn := &testConn{
+		reads: [][]byte{[]byte(`{"name":"demo.echo","data":{}}`)},
+	}
+	if err := Accept(AcceptOptions{
+		Conn:  conn,
+		Meta:  infra.NewMeta(),
+		Name:  "demo.socket",
+		Space: "room",
+	}); err != nil {
+		t.Fatalf("accept failed: %v", err)
+	}
+
+	if len(order) != 3 || order[0] != "global" || order[1] != "room" || order[2] != "action" {
+		t.Fatalf("unexpected filter order: %#v", order)
 	}
 }

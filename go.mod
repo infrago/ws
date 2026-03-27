@@ -3,9 +3,9 @@ module github.com/infrago/ws
 go 1.25.3
 
 require (
-	github.com/infrago/base v0.18.0
-	github.com/infrago/infra v0.18.0
-	github.com/infrago/log v0.18.0
+	github.com/infrago/base v0.19.0
+	github.com/infrago/infra v0.19.0
+	github.com/infrago/log v0.19.0
 )
 
 require (
@@ -13,6 +13,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/infrago/infra => ../infra
 
-replace github.com/infrago/log => ../log

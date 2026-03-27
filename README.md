@@ -4,7 +4,8 @@ infrago 的 WebSocket 模块。
 
 ## 能力
 
-- `http/web.Context.Upgrade()` 升级后自动接入 `ws`
+- `http/web.Context.Upgrade()` 默认接入已注册的默认接入点
+- `http.Endpoint / web.Endpoint` 可插拔接入
 - `ws.Hook`：`Open/Receive/Send/Close`
 - `ws.Filter`：入站消息执行链
 - `ws.Message`：客户端上行消息
@@ -14,6 +15,69 @@ infrago 的 WebSocket 模块。
 - `PushResult/BroadcastResult/GroupcastResult`
 - `ctx.Answer`
 - `ws.Export()` / `ws.Metrics()`
+
+## 接入模型
+
+`http/web` 只负责：
+
+- 路由
+- 权鉴 / 参数
+- `Upgrade`
+- 把升级后的连接交给已注册的 `Endpoint` 或默认 Upgrade 接管器
+
+`ws` 模块自己注册了默认 Upgrade 接管器，所以大多数项目直接这样用：
+
+```go
+infra.Register(".socket", web.Router{
+    Uri: "/socket",
+    Action: func(ctx *web.Context) {
+        if err := ctx.Upgrade(); err != nil {
+            ctx.Error(infra.Fail.With(err.Error()))
+        }
+    },
+})
+```
+
+默认规则：
+
+- `ctx.Upgrade()`：先找未命名默认 `Endpoint`，没有则走默认 Upgrade 接管器
+- `ctx.Upgrade("name")`：显式使用指定接入点
+
+自定义接入点示例：
+
+```go
+infra.Register("custom", web.Endpoint{
+    Name: "custom",
+    Desc: "自定义 ws 接入",
+    Accept: func(ctx *web.Context, socket web.Socket) error {
+        return ws.Accept(ws.AcceptOptions{
+            Conn:       socket,
+            Meta:       ctx.Meta,
+            Name:       ctx.Name,
+            Site:       ctx.Site,
+            Host:       ctx.Host,
+            Domain:     ctx.Domain,
+            RootDomain: ctx.RootDomain,
+            Path:       ctx.Path,
+            Uri:        ctx.Uri,
+            Setting:    ctx.Setting,
+            Params:     ctx.Params,
+            Query:      ctx.Query,
+            Form:       ctx.Form,
+            Value:      ctx.Value,
+            Args:       ctx.Args,
+            Locals:     ctx.Locals,
+        })
+    },
+})
+
+infra.Register(".custom.socket", web.Router{
+    Uri: "/socket/custom",
+    Action: func(ctx *web.Context) {
+        _ = ctx.Upgrade("custom")
+    },
+})
+```
 
 ## 配置
 

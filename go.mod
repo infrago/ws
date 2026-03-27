@@ -3,9 +3,9 @@ module github.com/infrago/ws
 go 1.25.3
 
 require (
-	github.com/infrago/base v0.17.0
-	github.com/infrago/infra v0.17.0
-	github.com/infrago/log v0.17.0
+	github.com/infrago/base v0.18.0
+	github.com/infrago/infra v0.18.0
+	github.com/infrago/log v0.18.0
 )
 
 require (

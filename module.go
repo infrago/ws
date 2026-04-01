@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -56,6 +57,7 @@ var (
 		handlers: make(map[string]map[string]Handler),
 		hooks:    make(map[string]map[string]Hook),
 		sessions: make(map[string]*Session),
+		bySpace:  make(map[string]map[string]*Session),
 		groups:   make(map[string]map[string]map[string]*Session),
 		users:    make(map[string]map[string]map[string]*Session),
 	}
@@ -83,9 +85,17 @@ type (
 		filterLists  map[string][]Filter
 		handlerLists map[string][]Handler
 		hookLists    map[string][]Hook
+		filterChains map[string][]ctxFunc
+		hookOpen     map[string][]ctxFunc
+		hookClose    map[string][]ctxFunc
+		hookReceive  map[string][]ctxFunc
+		hookSend     map[string][]ctxFunc
+		frameMessage int
+		frameCodecV  string
 
 		sessionMutex sync.RWMutex
 		sessions     map[string]*Session
+		bySpace      map[string]map[string]*Session
 		groups       map[string]map[string]map[string]*Session
 		users        map[string]map[string]map[string]*Session
 
@@ -230,8 +240,10 @@ type (
 
 		writeMutex sync.Mutex
 		closeOnce  sync.Once
+		cleanup    sync.Once
 		closed     chan struct{}
 		sendQueue  chan preparedFrame
+		drainReady chan struct{}
 	}
 
 	frameEnvelope struct {
@@ -266,6 +278,8 @@ type (
 	}
 
 	wsStats struct {
+		connections   atomic.Int64
+		users         atomic.Int64
 		received      atomic.Int64
 		sent          atomic.Int64
 		receiveFailed atomic.Int64
@@ -391,9 +405,19 @@ func (m *Module) Open() {
 	defer m.mutex.Unlock()
 	m.opened = true
 	m.config = normalizeConfig(m.config)
+	m.frameCodecV = m.config.Codec
+	m.frameMessage = TextMessage
+	if m.config.Format == "binary" {
+		m.frameMessage = BinaryMessage
+	}
 	m.filterLists = orderedSpaceValues(m.filters)
 	m.handlerLists = orderedSpaceValues(m.handlers)
 	m.hookLists = orderedSpaceValues(m.hooks)
+	m.filterChains = compileFilterChains(m.filterLists)
+	m.hookOpen = compileHookChains(m.hookLists, func(h Hook) ctxFunc { return h.Open })
+	m.hookClose = compileHookChains(m.hookLists, func(h Hook) ctxFunc { return h.Close })
+	m.hookReceive = compileHookChains(m.hookLists, func(h Hook) ctxFunc { return h.Receive })
+	m.hookSend = compileHookChains(m.hookLists, func(h Hook) ctxFunc { return h.Send })
 }
 
 func (m *Module) Start() {
@@ -406,7 +430,7 @@ func (m *Module) Stop() {
 
 func (m *Module) Close() {
 	for _, session := range m.sessionsSnapshot() {
-		_ = session.close()
+		m.shutdownSession(session)
 	}
 }
 
@@ -569,42 +593,52 @@ func Accept(opts AcceptOptions) error {
 	cfg := module.configSnapshot()
 	if cfg.QueueSize > 0 {
 		session.sendQueue = make(chan preparedFrame, cfg.QueueSize)
+		session.drainReady = make(chan struct{}, 1)
 	}
 
 	module.registerSession(session)
-	defer module.unregisterSession(session)
-	defer func() { _ = session.close() }()
+	defer module.shutdownSession(session)
 	module.configureSession(session)
-	module.startWriter(session)
-	module.startKeepalive(session)
+	module.startSessionLoop(session)
 
-	openCtx := module.newContext(session, opOpen)
-	module.callHooks(openCtx, func(h Hook) ctxFunc { return h.Open })
+	if chain := module.hookChain(session.Space, opOpen); len(chain) > 0 {
+		openCtx := module.newContext(session, opOpen, true, true)
+		module.callHookChain(openCtx, chain)
+	}
 
 	for {
 		messageType, payload, err := session.Conn.ReadMessage()
 		if err != nil {
-			module.stats.receiveFailed.Add(1)
-			closeCtx := module.newContext(session, opClose)
-			closeCtx.Input = nil
-			closeCtx.Type = messageType
-			closeCtx.Error(infra.Fail.With(err.Error()))
-			module.callHooks(closeCtx, func(h Hook) ctxFunc { return h.Close })
+			if !isNormalReadClose(err) {
+				module.stats.receiveFailed.Add(1)
+			}
+			if chain := module.hookChain(session.Space, opClose); len(chain) > 0 {
+				closeCtx := module.newContext(session, opClose, true, true)
+				closeCtx.Type = messageType
+				closeCtx.Error(infra.Fail.With(err.Error()))
+				module.callHookChain(closeCtx, chain)
+			}
+			module.waitQueueDrain(session, cfg.WriteTimeout)
 			return nil
 		}
 
-		receiveCtx := module.newContext(session, opReceive)
-		receiveCtx.Type = messageType
-		receiveCtx.Input = append([]byte(nil), payload...)
 		module.stats.received.Add(1)
 		module.stats.bytesReceived.Add(int64(len(payload)))
-		module.callHooks(receiveCtx, func(h Hook) ctxFunc { return h.Receive })
+		if chain := module.hookChain(session.Space, opReceive); len(chain) > 0 {
+			receiveCtx := module.newContext(session, opReceive, true, true)
+			receiveCtx.Type = messageType
+			receiveCtx.Input = payload
+			module.callHookChain(receiveCtx, chain)
+		}
 
 		if messageType == CloseMessage {
-			closeCtx := module.newContext(session, opClose)
-			closeCtx.Type = messageType
-			closeCtx.Input = append([]byte(nil), payload...)
-			module.callHooks(closeCtx, func(h Hook) ctxFunc { return h.Close })
+			if chain := module.hookChain(session.Space, opClose); len(chain) > 0 {
+				closeCtx := module.newContext(session, opClose, true, true)
+				closeCtx.Type = messageType
+				closeCtx.Input = payload
+				module.callHookChain(closeCtx, chain)
+			}
+			module.waitQueueDrain(session, cfg.WriteTimeout)
 			return nil
 		}
 		if messageType == PingMessage || messageType == PongMessage {
@@ -797,27 +831,32 @@ func (m *Module) groupcast(meta *infra.Meta, space, gid, msg string, value Map) 
 	})
 }
 
-func (m *Module) newContext(session *Session, op string) *Context {
+func (m *Module) newContext(session *Session, op string, withValue, withArgs bool) *Context {
 	meta := cloneMeta(session.Meta)
-	return &Context{
+	ctx := &Context{
 		Meta:    meta,
 		Session: session,
 		Conn:    session.Conn,
 		Op:      op,
 		Space:   session.Space,
 		Setting: cloneMap(session.Setting),
-		Value:   cloneMap(session.Value),
-		Args:    cloneMap(session.Args),
 		Locals:  cloneMap(session.Locals),
 	}
+	if withValue {
+		ctx.Value = cloneMap(session.Value)
+	}
+	if withArgs {
+		ctx.Args = cloneMap(session.Args)
+	}
+	return ctx
 }
 
 func (m *Module) handlePayload(session *Session, messageType int, payload []byte) {
 	frame, err := m.unmarshalFrameMap(payload)
 	if err != nil {
-		ctx := m.newContext(session, opMessage)
+		ctx := m.newContext(session, opMessage, false, true)
 		ctx.Type = messageType
-		ctx.Input = append([]byte(nil), payload...)
+		ctx.Input = payload
 		ctx.Invalid(infra.Invalid.With(err.Error()))
 		m.handle(ctx)
 		return
@@ -826,9 +865,9 @@ func (m *Module) handlePayload(session *Session, messageType int, payload []byte
 	name, raw := m.parseIncomingFrame(frame)
 	name = strings.TrimSpace(strings.ToLower(name))
 	if name == "" {
-		ctx := m.newContext(session, opMessage)
+		ctx := m.newContext(session, opMessage, false, true)
 		ctx.Type = messageType
-		ctx.Input = append([]byte(nil), payload...)
+		ctx.Input = payload
 		ctx.Invalid(infra.Invalid.With("invalid ws message"))
 		m.handle(ctx)
 		return
@@ -839,21 +878,21 @@ func (m *Module) handlePayload(session *Session, messageType int, payload []byte
 
 	cfg, ok := m.message(session.Space, name)
 	if !ok {
-		ctx := m.newContext(session, opMessage)
+		ctx := m.newContext(session, opMessage, false, true)
 		ctx.Name = name
 		ctx.Type = messageType
-		ctx.Input = append([]byte(nil), payload...)
+		ctx.Input = payload
 		ctx.Value = raw
 		ctx.Invalid(infra.Invalid.With("unknown ws message: %s", name))
 		m.handle(ctx)
 		return
 	}
 
-	ctx := m.newContext(session, opMessage)
+	ctx := m.newContext(session, opMessage, false, true)
 	ctx.Name = name
 	ctx.Message = cfg
 	ctx.Type = messageType
-	ctx.Input = append([]byte(nil), payload...)
+	ctx.Input = payload
 	ctx.Value = raw
 
 	if cfg.Args != nil {
@@ -921,11 +960,7 @@ func (m *Module) deliverSession(meta *infra.Meta, sid, msg string, value Map) De
 }
 
 func (m *Module) deliverUser(meta *infra.Meta, space, uid, msg string, value Map) Delivery {
-	result := Delivery{}
-	for _, session := range m.userSessions(space, uid) {
-		result.merge(m.deliverPrepared(session, m.prepareFrame(meta, session, msg, value, nil)))
-	}
-	return result
+	return m.deliverMany(meta, m.userSessions(space, uid), msg, value)
 }
 
 func (m *Module) deliverBroadcast(meta *infra.Meta, space, msg string, value Map) Delivery {
@@ -943,6 +978,16 @@ func (m *Module) deliverMany(meta *infra.Meta, sessions []*Session, msg string, 
 	}
 
 	prepared, ok := m.prepareSharedFrame(meta, sessions, msg, value)
+	if !ok {
+		if grouped, ok := m.prepareGroupedFrames(meta, sessions, msg, value); ok {
+			for _, item := range grouped {
+				for _, session := range item.sessions {
+					result.merge(m.deliverPrepared(session, item.prepared))
+				}
+			}
+			return result
+		}
+	}
 	for _, session := range sessions {
 		if ok {
 			result.merge(m.deliverPrepared(session, prepared))
@@ -951,6 +996,65 @@ func (m *Module) deliverMany(meta *infra.Meta, sessions []*Session, msg string, 
 		result.merge(m.deliverPrepared(session, m.prepareFrame(meta, session, msg, value, nil)))
 	}
 	return result
+}
+
+type preparedBucket struct {
+	prepared preparedFrame
+	sessions []*Session
+}
+
+func (m *Module) prepareGroupedFrames(meta *infra.Meta, sessions []*Session, msg string, value Map) ([]preparedBucket, bool) {
+	if meta != nil || len(sessions) == 0 {
+		return nil, false
+	}
+	name := strings.TrimSpace(strings.ToLower(msg))
+	if name == "" {
+		return nil, false
+	}
+	command, ok := m.command(sessions[0].Space, name)
+	if !ok || command.Args == nil {
+		return nil, false
+	}
+
+	grouped := groupSessionsByTimezone(sessions)
+	if len(grouped) == 0 {
+		return nil, false
+	}
+
+	out := make([]preparedBucket, 0, len(grouped))
+	for _, bucket := range grouped {
+		if len(bucket) == 0 {
+			continue
+		}
+		prepared := m.prepareFrame(nil, bucket[0], msg, value, nil)
+		out = append(out, preparedBucket{prepared: prepared, sessions: bucket})
+	}
+	return out, len(out) > 0
+}
+
+func groupSessionsByTimezone(sessions []*Session) [][]*Session {
+	if len(sessions) == 0 {
+		return nil
+	}
+	groups := make(map[string][]*Session)
+	order := make([]string, 0)
+	for _, session := range sessions {
+		key := ""
+		if session != nil && session.Meta != nil {
+			if loc := session.Meta.Timezone(); loc != nil {
+				key = loc.String()
+			}
+		}
+		if _, ok := groups[key]; !ok {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], session)
+	}
+	out := make([][]*Session, 0, len(order))
+	for _, key := range order {
+		out = append(out, groups[key])
+	}
+	return out
 }
 
 func (m *Module) prepareSharedFrame(meta *infra.Meta, sessions []*Session, msg string, value Map) (preparedFrame, bool) {
@@ -1067,8 +1171,7 @@ func (m *Module) deliverPrepared(session *Session, prepared preparedFrame) Deliv
 		if err := m.writePrepared(session, prepared); err != nil {
 			result.Failed = 1
 			result.FirstError = err.Error()
-			m.unregisterSession(session)
-			_ = session.close()
+			m.shutdownSession(session)
 			return result
 		}
 		result.Success = 1
@@ -1134,8 +1237,7 @@ func (m *Module) enqueuePrepared(session *Session, prepared preparedFrame) error
 		default:
 			m.stats.dropped.Add(1)
 			m.stats.sendFailed.Add(1)
-			m.unregisterSession(session)
-			_ = session.close()
+			m.shutdownSession(session)
 			return errors.New("ws send queue full")
 		}
 	}
@@ -1169,23 +1271,57 @@ func shouldDropLowPriority(session *Session, prepared preparedFrame) bool {
 	return len(session.sendQueue)*100/capacity >= 75
 }
 
-func (m *Module) startWriter(session *Session) {
-	if session == nil || session.sendQueue == nil {
+func (m *Module) startSessionLoop(session *Session) {
+	if session == nil || session.Conn == nil {
+		return
+	}
+
+	cfg := m.configSnapshot()
+	queue := (<-chan preparedFrame)(nil)
+	if session.sendQueue != nil {
+		queue = session.sendQueue
+	}
+	var ticker *time.Ticker
+	var ticks <-chan time.Time
+	if cfg.PingInterval > 0 {
+		ticker = time.NewTicker(cfg.PingInterval)
+		ticks = ticker.C
+	}
+	if queue == nil && ticks == nil {
 		return
 	}
 
 	go func() {
+		if ticker != nil {
+			defer ticker.Stop()
+		}
 		for {
 			select {
 			case <-session.closed:
+				if session.sendQueue != nil {
+					if pending := len(session.sendQueue); pending > 0 {
+						m.stats.queued.Add(-int64(pending))
+					}
+				}
 				return
-			case prepared, ok := <-session.sendQueue:
+			case prepared, ok := <-queue:
 				if !ok {
 					return
 				}
+				m.stats.queued.Add(-1)
 				if err := m.writePrepared(session, prepared); err != nil {
-					m.unregisterSession(session)
-					_ = session.close()
+					m.shutdownSession(session)
+					return
+				}
+				if session.sendQueue != nil && len(session.sendQueue) == 0 && session.drainReady != nil {
+					select {
+					case session.drainReady <- struct{}{}:
+					default:
+					}
+				}
+			case <-ticks:
+				if err := m.writeFrame(session, PingMessage, nil, cfg.WriteTimeout); err != nil {
+					m.shutdownSession(session)
 					return
 				}
 			}
@@ -1201,15 +1337,17 @@ func (m *Module) writePrepared(session *Session, prepared preparedFrame) error {
 		return prepared.Err
 	}
 
-	ctx := m.newContext(session, opSend)
-	ctx.Name = prepared.Name
-	if prepared.HasCmd {
-		ctx.Command = prepared.Command
+	if chain := m.hookChain(session.Space, opSend); len(chain) > 0 {
+		ctx := m.newContext(session, opSend, false, false)
+		ctx.Name = prepared.Name
+		if prepared.HasCmd {
+			ctx.Command = prepared.Command
+		}
+		ctx.Value = cloneMap(prepared.Raw)
+		ctx.Args = cloneMap(prepared.Args)
+		ctx.Output = append([]byte(nil), prepared.Data...)
+		m.callHookChain(ctx, chain)
 	}
-	ctx.Value = cloneMap(prepared.Raw)
-	ctx.Args = cloneMap(prepared.Args)
-	ctx.Output = append([]byte(nil), prepared.Data...)
-	m.callHooks(ctx, func(h Hook) ctxFunc { return h.Send })
 
 	cfg := m.configSnapshot()
 	if err := m.writeFrame(session, m.frameType(), prepared.Data, cfg.WriteTimeout); err != nil {
@@ -1221,6 +1359,62 @@ func (m *Module) writePrepared(session *Session, prepared preparedFrame) error {
 	return nil
 }
 
+func (m *Module) shutdownSession(session *Session) {
+	if session == nil {
+		return
+	}
+	session.cleanup.Do(func() {
+		_ = session.close()
+		m.unregisterSession(session)
+	})
+}
+
+func (m *Module) waitQueueDrain(session *Session, timeout time.Duration) {
+	if session == nil || session.sendQueue == nil {
+		return
+	}
+	if len(session.sendQueue) == 0 {
+		return
+	}
+	if session.drainReady == nil {
+		deadline := time.Now().Add(timeout)
+		for len(session.sendQueue) > 0 {
+			if timeout > 0 && time.Now().After(deadline) {
+				return
+			}
+			select {
+			case <-session.closed:
+				return
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
+		return
+	}
+	if timeout <= 0 {
+		for len(session.sendQueue) > 0 {
+			select {
+			case <-session.closed:
+				return
+			case <-session.drainReady:
+			}
+		}
+		return
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for len(session.sendQueue) > 0 {
+		select {
+		case <-session.closed:
+			return
+		case <-session.drainReady:
+		case <-timer.C:
+			return
+		}
+	}
+}
+
 func (m *Module) registerSession(session *Session) {
 	if session == nil {
 		return
@@ -1229,13 +1423,22 @@ func (m *Module) registerSession(session *Session) {
 
 	m.sessionMutex.Lock()
 	defer m.sessionMutex.Unlock()
+	if _, ok := m.sessions[session.ID]; ok {
+		return
+	}
 	m.sessions[session.ID] = session
+	if _, ok := m.bySpace[session.Space]; !ok {
+		m.bySpace[session.Space] = make(map[string]*Session)
+	}
+	m.bySpace[session.Space][session.ID] = session
+	m.stats.connections.Add(1)
 	if uid := strings.TrimSpace(session.User); uid != "" {
 		if _, ok := m.users[session.Space]; !ok {
 			m.users[session.Space] = make(map[string]map[string]*Session)
 		}
 		if _, ok := m.users[session.Space][uid]; !ok {
 			m.users[session.Space][uid] = make(map[string]*Session)
+			m.stats.users.Add(1)
 		}
 		m.users[session.Space][uid][session.ID] = session
 	}
@@ -1250,12 +1453,17 @@ func (m *Module) unregisterSession(session *Session) {
 	m.leaveAll(session)
 
 	m.sessionMutex.Lock()
+	if _, ok := m.sessions[session.ID]; !ok {
+		m.sessionMutex.Unlock()
+		return
+	}
 	if uid := strings.TrimSpace(session.User); uid != "" {
 		if spaceUsers, ok := m.users[session.Space]; ok {
 			if members, ok := spaceUsers[uid]; ok {
 				delete(members, session.ID)
 				if len(members) == 0 {
 					delete(spaceUsers, uid)
+					m.stats.users.Add(-1)
 				}
 			}
 			if len(spaceUsers) == 0 {
@@ -1263,7 +1471,14 @@ func (m *Module) unregisterSession(session *Session) {
 			}
 		}
 	}
+	if spaceSessions, ok := m.bySpace[session.Space]; ok {
+		delete(spaceSessions, session.ID)
+		if len(spaceSessions) == 0 {
+			delete(m.bySpace, session.Space)
+		}
+	}
 	delete(m.sessions, session.ID)
+	m.stats.connections.Add(-1)
 	m.sessionMutex.Unlock()
 }
 
@@ -1361,6 +1576,7 @@ func (m *Module) bindUser(session *Session, uid string) {
 				delete(members, session.ID)
 				if len(members) == 0 {
 					delete(spaceUsers, current)
+					m.stats.users.Add(-1)
 				}
 			}
 			if len(spaceUsers) == 0 {
@@ -1378,6 +1594,7 @@ func (m *Module) bindUser(session *Session, uid string) {
 	}
 	if _, ok := m.users[session.Space][uid]; !ok {
 		m.users[session.Space][uid] = make(map[string]*Session)
+		m.stats.users.Add(1)
 	}
 	m.users[session.Space][uid][session.ID] = session
 }
@@ -1460,11 +1677,12 @@ func (m *Module) sessionsSnapshot(space ...string) []*Session {
 	if len(space) > 0 {
 		targetSpace = normalizeSpace(space[0])
 	}
-	out := make([]*Session, 0, len(m.sessions))
-	for _, session := range m.sessions {
-		if targetSpace != "" && session.Space != targetSpace {
-			continue
-		}
+	source := m.sessions
+	if targetSpace != "" {
+		source = m.bySpace[targetSpace]
+	}
+	out := make([]*Session, 0, len(source))
+	for _, session := range source {
 		out = append(out, session)
 	}
 	return out
@@ -1493,29 +1711,49 @@ func (m *Module) filterChain(space string) []ctxFunc {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	out := make([]ctxFunc, 0)
-	for _, filter := range appendSpaceValues(m.filterLists, space) {
-		if filter.Message != nil {
-			out = append(out, filter.Message)
-		}
+	space = normalizeSpace(space)
+	if chain := m.filterChains[space]; len(chain) > 0 {
+		return chain
 	}
-	return out
+	return m.filterChains[infra.DEFAULT]
 }
 
 func (m *Module) handlerChain(space string) []Handler {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	return pickHandlerValues(m.handlerLists, space)
+	space = normalizeSpace(space)
+	if handlers := m.handlerLists[space]; len(handlers) > 0 {
+		return handlers
+	}
+	return m.handlerLists[infra.DEFAULT]
 }
 
-func (m *Module) callHooks(ctx *Context, pick func(Hook) ctxFunc) {
+func (m *Module) hookChain(space, op string) []ctxFunc {
 	m.mutex.RLock()
-	hooks := appendSpaceValues(m.hookLists, ctx.Space)
-	m.mutex.RUnlock()
+	defer m.mutex.RUnlock()
 
-	for _, hook := range hooks {
-		if fn := pick(hook); fn != nil {
+	space = normalizeSpace(space)
+	var hooks map[string][]ctxFunc
+	switch op {
+	case opOpen:
+		hooks = m.hookOpen
+	case opReceive:
+		hooks = m.hookReceive
+	case opSend:
+		hooks = m.hookSend
+	default:
+		hooks = m.hookClose
+	}
+	if chain := hooks[space]; len(chain) > 0 {
+		return chain
+	}
+	return hooks[infra.DEFAULT]
+}
+
+func (m *Module) callHookChain(ctx *Context, chain []ctxFunc) {
+	for _, fn := range chain {
+		if fn != nil {
 			fn(ctx)
 		}
 	}
@@ -1718,8 +1956,8 @@ func (m *Module) metrics() Stats {
 	bytesReceived := m.stats.bytesReceived.Load()
 	bytesSent := m.stats.bytesSent.Load()
 	stats := Stats{
-		Connections:      int64(len(m.sessionsSnapshot())),
-		Users:            int64(len(m.userSnapshot())),
+		Connections:      m.stats.connections.Load(),
+		Users:            m.stats.users.Load(),
 		MessagesReceived: received,
 		MessagesSent:     sent,
 		ReceiveFailed:    m.stats.receiveFailed.Load(),
@@ -1854,6 +2092,98 @@ func orderedValues[T any](items map[string]T) []T {
 	return out
 }
 
+func compileFilterChains(items map[string][]Filter) map[string][]ctxFunc {
+	if len(items) == 0 {
+		return nil
+	}
+
+	base := extractFilterFuncs(items[infra.DEFAULT])
+	out := make(map[string][]ctxFunc, len(items))
+	if len(base) > 0 {
+		out[infra.DEFAULT] = base
+	}
+
+	for space, filters := range items {
+		if space == infra.DEFAULT {
+			continue
+		}
+		curr := extractFilterFuncs(filters)
+		switch {
+		case len(base) == 0 && len(curr) == 0:
+			continue
+		case len(base) == 0:
+			out[space] = curr
+		case len(curr) == 0:
+			out[space] = base
+		default:
+			chain := make([]ctxFunc, 0, len(base)+len(curr))
+			chain = append(chain, base...)
+			chain = append(chain, curr...)
+			out[space] = chain
+		}
+	}
+	return out
+}
+
+func compileHookChains(items map[string][]Hook, pick func(Hook) ctxFunc) map[string][]ctxFunc {
+	if len(items) == 0 {
+		return nil
+	}
+
+	base := extractHookFuncs(items[infra.DEFAULT], pick)
+	out := make(map[string][]ctxFunc, len(items))
+	if len(base) > 0 {
+		out[infra.DEFAULT] = base
+	}
+
+	for space, hooks := range items {
+		if space == infra.DEFAULT {
+			continue
+		}
+		curr := extractHookFuncs(hooks, pick)
+		switch {
+		case len(base) == 0 && len(curr) == 0:
+			continue
+		case len(base) == 0:
+			out[space] = curr
+		case len(curr) == 0:
+			out[space] = base
+		default:
+			chain := make([]ctxFunc, 0, len(base)+len(curr))
+			chain = append(chain, base...)
+			chain = append(chain, curr...)
+			out[space] = chain
+		}
+	}
+	return out
+}
+
+func extractFilterFuncs(filters []Filter) []ctxFunc {
+	if len(filters) == 0 {
+		return nil
+	}
+	out := make([]ctxFunc, 0, len(filters))
+	for _, filter := range filters {
+		if filter.Message != nil {
+			out = append(out, filter.Message)
+		}
+	}
+	return out
+}
+
+func extractHookFuncs(hooks []Hook, pick func(Hook) ctxFunc) []ctxFunc {
+	if len(hooks) == 0 {
+		return nil
+	}
+	out := make([]ctxFunc, 0, len(hooks))
+	for _, hook := range hooks {
+		if fn := pick(hook); fn != nil {
+			out = append(out, fn)
+		}
+	}
+	return out
+}
+
 func (d *Delivery) merge(other Delivery) {
 	d.Hit += other.Hit
 	d.Success += other.Success
@@ -1976,6 +2306,9 @@ func (m *Module) frameType() int {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
+	if m.frameMessage != 0 {
+		return m.frameMessage
+	}
 	if strings.TrimSpace(strings.ToLower(m.config.Format)) == "binary" {
 		return BinaryMessage
 	}
@@ -1986,7 +2319,10 @@ func (m *Module) frameCodec() string {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	codec := strings.TrimSpace(strings.ToLower(m.config.Codec))
+	codec := m.frameCodecV
+	if codec == "" {
+		codec = strings.TrimSpace(strings.ToLower(m.config.Codec))
+	}
 	if codec == "" {
 		return infra.JSON
 	}
@@ -2316,6 +2652,20 @@ func anyToString(value Any) string {
 	}
 }
 
+func isNormalReadClose(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	text := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(text, "close 1000") ||
+		strings.Contains(text, "close 1001") ||
+		strings.Contains(text, "going away") ||
+		strings.Contains(text, "use of closed network connection")
+}
+
 func storeNamed[T any](target map[string]T, name string, value T) {
 	if infra.Override() {
 		target[name] = value
@@ -2417,34 +2767,6 @@ func (m *Module) configureSession(session *Session) {
 			_ = conn.SetCompressionLevel(cfg.CompressLevel)
 		}
 	}
-}
-
-func (m *Module) startKeepalive(session *Session) {
-	if session == nil || session.Conn == nil {
-		return
-	}
-
-	cfg := m.configSnapshot()
-	if cfg.PingInterval <= 0 {
-		return
-	}
-
-	go func() {
-		ticker := time.NewTicker(cfg.PingInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-session.closed:
-				return
-			case <-ticker.C:
-				if err := m.writeFrame(session, PingMessage, nil, cfg.WriteTimeout); err != nil {
-					m.unregisterSession(session)
-					_ = session.close()
-					return
-				}
-			}
-		}
-	}()
 }
 
 func (m *Module) writeFrame(session *Session, messageType int, data []byte, timeout time.Duration) error {

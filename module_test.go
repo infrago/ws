@@ -85,11 +85,19 @@ func resetModuleForTest() {
 	module.filterLists = nil
 	module.handlerLists = nil
 	module.hookLists = nil
+	module.filterChains = nil
+	module.hookOpen = nil
+	module.hookClose = nil
+	module.hookReceive = nil
+	module.hookSend = nil
+	module.frameMessage = 0
+	module.frameCodecV = ""
 	module.stats = wsStats{}
 	module.mutex.Unlock()
 
 	module.sessionMutex.Lock()
 	module.sessions = make(map[string]*Session)
+	module.bySpace = make(map[string]map[string]*Session)
 	module.groups = make(map[string]map[string]map[string]*Session)
 	module.users = make(map[string]map[string]map[string]*Session)
 	module.sessionMutex.Unlock()
@@ -512,6 +520,74 @@ func TestLowPriorityAutoDropsUnderPressure(t *testing.T) {
 	result := module.deliverPrepared(session, module.prepareFrame(nil, session, "demo.low", Map{"ok": true}, nil))
 	if result.Failed != 1 || result.FirstError == "" {
 		t.Fatalf("expected low priority drop under pressure: %#v", result)
+	}
+}
+
+func TestMetricsQueuedTracksCurrentDepth(t *testing.T) {
+	resetModuleForTest()
+	module.Config(Map{"ws": Map{"queue_size": 4}})
+	module.RegisterCommand("demo.notice", Command{})
+	module.Open()
+
+	session := &Session{
+		ID:        "s1",
+		Meta:      infra.NewMeta(),
+		Conn:      &testConn{},
+		closed:    make(chan struct{}),
+		sendQueue: make(chan preparedFrame, 4),
+		Groups:    map[string]Any{},
+	}
+
+	module.deliverPrepared(session, module.prepareFrame(nil, session, "demo.notice", Map{"n": 1}, nil))
+	module.deliverPrepared(session, module.prepareFrame(nil, session, "demo.notice", Map{"n": 2}, nil))
+	if got := module.metrics().Queued; got != 2 {
+		t.Fatalf("expected queued depth 2 before drain, got %d", got)
+	}
+
+	module.startSessionLoop(session)
+	time.Sleep(20 * time.Millisecond)
+	if got := module.metrics().Queued; got != 0 {
+		t.Fatalf("expected queued depth 0 after drain, got %d", got)
+	}
+	module.shutdownSession(session)
+}
+
+func TestSessionLoopSendsPingWithoutQueue(t *testing.T) {
+	resetModuleForTest()
+	module.Config(Map{"ws": Map{"ping_interval": "10ms", "write_timeout": "5ms", "queue_size": 0}})
+	module.Open()
+
+	conn := &testConn{}
+	session := &Session{
+		ID:     "s1",
+		Meta:   infra.NewMeta(),
+		Conn:   conn,
+		closed: make(chan struct{}),
+		Groups: map[string]Any{},
+	}
+
+	module.startSessionLoop(session)
+	time.Sleep(25 * time.Millisecond)
+	module.shutdownSession(session)
+
+	if len(conn.writeTypes) == 0 || conn.writeTypes[0] != PingMessage {
+		t.Fatalf("expected keepalive ping write, got %#v", conn.writeTypes)
+	}
+}
+
+func TestEOFDoesNotCountAsReceiveFailed(t *testing.T) {
+	resetModuleForTest()
+	module.Open()
+
+	if err := Accept(AcceptOptions{
+		Conn: &testConn{},
+		Meta: infra.NewMeta(),
+		Name: "demo.socket",
+	}); err != nil {
+		t.Fatalf("accept failed: %v", err)
+	}
+	if got := module.metrics().ReceiveFailed; got != 0 {
+		t.Fatalf("expected eof close not counted as receive failure, got %d", got)
 	}
 }
 

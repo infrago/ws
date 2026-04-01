@@ -145,6 +145,11 @@ observe_trace = false
 - `normal`：按模块级 `queue_policy`
 - `low`：高压时自动丢弃，默认按 `drop`
 
+指标约定：
+
+- `queued` 表示当前发送队列深度，不是累计入队次数
+- `dropped` 表示被丢弃的消息累计次数
+
 ## 示例
 
 ```go

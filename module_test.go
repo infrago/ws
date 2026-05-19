@@ -289,6 +289,31 @@ func TestAcceptMergesRemainingFieldsIntoArgs(t *testing.T) {
 	}
 }
 
+func TestAcceptEmptyDataUsesEmptyValue(t *testing.T) {
+	resetModuleForTest()
+
+	module.RegisterMessage("demo.empty", Message{
+		Action: func(ctx *Context) {
+			if len(ctx.Value) != 0 {
+				t.Fatalf("expected empty value, got %#v", ctx.Value)
+			}
+		},
+	})
+	module.Open()
+
+	conn := &testConn{
+		reads: [][]byte{[]byte(`{"name":"demo.empty","data":{}}`)},
+	}
+
+	if err := Accept(AcceptOptions{
+		Conn: conn,
+		Meta: infra.NewMeta(),
+		Name: "demo.socket",
+	}); err != nil {
+		t.Fatalf("accept failed: %v", err)
+	}
+}
+
 func TestGroupcastLocal(t *testing.T) {
 	resetModuleForTest()
 	module.Open()
@@ -414,6 +439,19 @@ func TestBroadcastResultCounts(t *testing.T) {
 	}
 }
 
+func TestBroadcastEmptyMessageFails(t *testing.T) {
+	resetModuleForTest()
+	module.Open()
+
+	session := &Session{ID: "s1", Meta: infra.NewMeta(), Conn: &testConn{}, Groups: map[string]Any{}, closed: make(chan struct{})}
+	module.registerSession(session)
+
+	result := module.deliverBroadcast(nil, infra.DEFAULT, "", Map{"ok": true})
+	if result.Hit != 1 || result.Failed != 1 || result.FirstError == "" {
+		t.Fatalf("expected invalid empty message failure: %#v", result)
+	}
+}
+
 func TestConfigureSessionAppliesReadLimit(t *testing.T) {
 	resetModuleForTest()
 
@@ -470,6 +508,127 @@ func TestAcceptCloseFrameTriggersCloseHook(t *testing.T) {
 
 	if !closed {
 		t.Fatalf("expected close hook to be called")
+	}
+}
+
+func TestShutdownSessionTriggersCloseHookOnce(t *testing.T) {
+	resetModuleForTest()
+
+	closed := 0
+	module.RegisterHook("demo.close", Hook{
+		Close: func(ctx *Context) {
+			closed++
+		},
+	})
+	module.Open()
+
+	session := &Session{ID: "s1", Meta: infra.NewMeta(), Conn: &testConn{}, Groups: map[string]Any{}, closed: make(chan struct{})}
+	module.registerSession(session)
+	module.shutdownSession(session)
+	module.shutdownSession(session)
+
+	if closed != 1 {
+		t.Fatalf("expected close hook once, got %d", closed)
+	}
+}
+
+func TestSendHookCanModifyOutput(t *testing.T) {
+	resetModuleForTest()
+
+	module.RegisterCommand("demo.notice", Command{})
+	module.RegisterHook("demo.send", Hook{
+		Send: func(ctx *Context) {
+			ctx.Output = []byte(`{"code":0,"name":"demo.changed","data":{"ok":true}}`)
+		},
+	})
+	module.Open()
+
+	conn := &testConn{}
+	session := &Session{ID: "s1", Meta: infra.NewMeta(), Conn: conn, Groups: map[string]Any{}, closed: make(chan struct{})}
+	if err := module.sendLocal(nil, session, "demo.notice", Map{"ok": false}); err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+	if len(conn.writes) != 1 || !strings.Contains(string(conn.writes[0]), "demo.changed") {
+		t.Fatalf("expected modified output, got %#v", conn.writes)
+	}
+}
+
+func TestShutdownInSendHookDoesNotSelfWait(t *testing.T) {
+	resetModuleForTest()
+
+	module.Config(Map{"ws": Map{"write_timeout": "2s"}})
+	module.RegisterCommand("demo.notice", Command{})
+	module.RegisterHook("demo.send", Hook{
+		Send: func(ctx *Context) {
+			module.shutdownSession(ctx.Session)
+		},
+	})
+	module.Open()
+
+	conn := &testConn{}
+	session := &Session{ID: "s1", Meta: infra.NewMeta(), Conn: conn, Groups: map[string]Any{}, closed: make(chan struct{})}
+	module.registerSession(session)
+
+	start := time.Now()
+	if err := module.sendLocal(nil, session, "demo.notice", Map{"ok": true}); err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("shutdown in send hook waited too long: %s", elapsed)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for module.sessionByID("s1") != nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := module.sessionByID("s1"); got != nil {
+		t.Fatalf("expected session to be closed after active write")
+	}
+}
+
+func TestHookPanicDoesNotEscape(t *testing.T) {
+	resetModuleForTest()
+
+	module.RegisterHook("demo.open", Hook{
+		Open: func(ctx *Context) {
+			panic("boom")
+		},
+	})
+	module.Open()
+
+	if err := Accept(AcceptOptions{
+		Conn: &testConn{},
+		Meta: infra.NewMeta(),
+		Name: "demo.socket",
+	}); err != nil {
+		t.Fatalf("accept failed: %v", err)
+	}
+}
+
+func TestInternalDispatchRejectsUnknownOp(t *testing.T) {
+	resetModuleForTest()
+	module.Open()
+
+	_, res, ok := host.InvokeLocalMessage(infra.NewMeta(), internalDispatch, Map{
+		"op":  "bad",
+		"msg": "demo.notice",
+	})
+	if !ok || res == nil || !res.Fail() {
+		t.Fatalf("expected invalid internal dispatch op, ok=%v res=%v", ok, res)
+	}
+}
+
+func TestInternalDispatchPushMissingSessionIsNoop(t *testing.T) {
+	resetModuleForTest()
+	module.Open()
+
+	_, res, ok := host.InvokeLocalMessage(infra.NewMeta(), internalDispatch, Map{
+		"op":  dispatchPush,
+		"sid": "missing",
+		"msg": "demo.notice",
+	})
+	if !ok || res == nil || res.Fail() {
+		t.Fatalf("expected missing sid push to be noop, ok=%v res=%v", ok, res)
 	}
 }
 

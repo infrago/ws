@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -238,28 +239,16 @@ type (
 		Meta *infra.Meta `json:"-"`
 		Conn Conn        `json:"-"`
 
-		writeMutex sync.Mutex
-		closeOnce  sync.Once
-		cleanup    sync.Once
-		closed     chan struct{}
-		sendQueue  chan preparedFrame
-		drainReady chan struct{}
-	}
-
-	frameEnvelope struct {
-		Msg  string `json:"msg"`
-		Args Map    `json:"args,omitempty"`
-		Data Map    `json:"data,omitempty"`
-	}
-
-	dispatchEnvelope struct {
-		Op    string `json:"op"`
-		Space string `json:"space,omitempty"`
-		Sid   string `json:"sid,omitempty"`
-		Uid   string `json:"uid,omitempty"`
-		Gid   string `json:"gid,omitempty"`
-		Msg   string `json:"msg"`
-		Args  Map    `json:"args,omitempty"`
+		writeMutex    sync.Mutex
+		closing       atomic.Bool
+		activeWrites  atomic.Int64
+		pendingWrites atomic.Int64
+		closeOnce     sync.Once
+		closeHookOnce sync.Once
+		cleanup       sync.Once
+		closed        chan struct{}
+		sendQueue     chan preparedFrame
+		drainReady    chan struct{}
 	}
 
 	preparedFrame struct {
@@ -612,12 +601,7 @@ func Accept(opts AcceptOptions) error {
 			if !isNormalReadClose(err) {
 				module.stats.receiveFailed.Add(1)
 			}
-			if chain := module.hookChain(session.Space, opClose); len(chain) > 0 {
-				closeCtx := module.newContext(session, opClose, true, true)
-				closeCtx.Type = messageType
-				closeCtx.Error(infra.Fail.With(err.Error()))
-				module.callHookChain(closeCtx, chain)
-			}
+			module.notifyClose(session, messageType, nil, err)
 			module.waitQueueDrain(session, cfg.WriteTimeout)
 			return nil
 		}
@@ -632,12 +616,7 @@ func Accept(opts AcceptOptions) error {
 		}
 
 		if messageType == CloseMessage {
-			if chain := module.hookChain(session.Space, opClose); len(chain) > 0 {
-				closeCtx := module.newContext(session, opClose, true, true)
-				closeCtx.Type = messageType
-				closeCtx.Input = payload
-				module.callHookChain(closeCtx, chain)
-			}
+			module.notifyClose(session, messageType, payload, nil)
 			module.waitQueueDrain(session, cfg.WriteTimeout)
 			return nil
 		}
@@ -932,15 +911,15 @@ func (m *Module) handle(ctx *Context) {
 		switch ctx.handling {
 		case "invalid":
 			if handler.Invalid != nil {
-				handler.Invalid(ctx)
+				m.callContextFunc(ctx, handler.Invalid)
 			}
 		case "denied":
 			if handler.Denied != nil {
-				handler.Denied(ctx)
+				m.callContextFunc(ctx, handler.Denied)
 			}
 		default:
 			if handler.Error != nil {
-				handler.Error(ctx)
+				m.callContextFunc(ctx, handler.Error)
 			}
 		}
 	}
@@ -1064,7 +1043,7 @@ func (m *Module) prepareSharedFrame(meta *infra.Meta, sessions []*Session, msg s
 
 	name := strings.TrimSpace(strings.ToLower(msg))
 	if name == "" {
-		return preparedFrame{Name: ""}, true
+		return preparedFrame{Err: errors.New("invalid ws command")}, true
 	}
 
 	first := sessions[0]
@@ -1159,6 +1138,12 @@ func (m *Module) deliverPrepared(session *Session, prepared preparedFrame) Deliv
 		result.FirstError = "invalid ws session"
 		return result
 	}
+	if session.closing.Load() {
+		result.Hit = 1
+		result.Failed = 1
+		result.FirstError = "ws session closed"
+		return result
+	}
 
 	result.Hit = 1
 	if prepared.Err != nil {
@@ -1192,6 +1177,10 @@ func (m *Module) enqueuePrepared(session *Session, prepared preparedFrame) error
 	if session == nil {
 		return errors.New("invalid ws session")
 	}
+	if session.closing.Load() {
+		m.stats.sendFailed.Add(1)
+		return errors.New("ws session closed")
+	}
 	if session.sendQueue == nil {
 		return m.writePrepared(session, prepared)
 	}
@@ -1203,6 +1192,13 @@ func (m *Module) enqueuePrepared(session *Session, prepared preparedFrame) error
 		m.stats.sendFailed.Add(1)
 		return errors.New("ws send queue degraded")
 	}
+	session.pendingWrites.Add(1)
+	queued := false
+	defer func() {
+		if !queued {
+			session.pendingWrites.Add(-1)
+		}
+	}()
 	switch policy {
 	case "block":
 		select {
@@ -1210,6 +1206,7 @@ func (m *Module) enqueuePrepared(session *Session, prepared preparedFrame) error
 			m.stats.sendFailed.Add(1)
 			return errors.New("ws session closed")
 		case session.sendQueue <- prepared:
+			queued = true
 			m.stats.queued.Add(1)
 			return nil
 		}
@@ -1219,6 +1216,7 @@ func (m *Module) enqueuePrepared(session *Session, prepared preparedFrame) error
 			m.stats.sendFailed.Add(1)
 			return errors.New("ws session closed")
 		case session.sendQueue <- prepared:
+			queued = true
 			m.stats.queued.Add(1)
 			return nil
 		default:
@@ -1232,6 +1230,7 @@ func (m *Module) enqueuePrepared(session *Session, prepared preparedFrame) error
 			m.stats.sendFailed.Add(1)
 			return errors.New("ws session closed")
 		case session.sendQueue <- prepared:
+			queued = true
 			m.stats.queued.Add(1)
 			return nil
 		default:
@@ -1309,10 +1308,15 @@ func (m *Module) startSessionLoop(session *Session) {
 					return
 				}
 				m.stats.queued.Add(-1)
-				if err := m.writePrepared(session, prepared); err != nil {
+				session.activeWrites.Add(1)
+				if err := m.writePreparedActive(session, prepared); err != nil {
+					session.activeWrites.Add(-1)
+					session.pendingWrites.Add(-1)
 					m.shutdownSession(session)
 					return
 				}
+				session.activeWrites.Add(-1)
+				session.pendingWrites.Add(-1)
 				if session.sendQueue != nil && len(session.sendQueue) == 0 && session.drainReady != nil {
 					select {
 					case session.drainReady <- struct{}{}:
@@ -1320,7 +1324,10 @@ func (m *Module) startSessionLoop(session *Session) {
 					}
 				}
 			case <-ticks:
-				if err := m.writeFrame(session, PingMessage, nil, cfg.WriteTimeout); err != nil {
+				session.activeWrites.Add(1)
+				err := m.writeFrame(session, PingMessage, nil, cfg.WriteTimeout)
+				session.activeWrites.Add(-1)
+				if err != nil {
 					m.shutdownSession(session)
 					return
 				}
@@ -1337,6 +1344,21 @@ func (m *Module) writePrepared(session *Session, prepared preparedFrame) error {
 		return prepared.Err
 	}
 
+	session.activeWrites.Add(1)
+	defer session.activeWrites.Add(-1)
+
+	return m.writePreparedActive(session, prepared)
+}
+
+func (m *Module) writePreparedActive(session *Session, prepared preparedFrame) error {
+	if session == nil {
+		return errors.New("invalid ws session")
+	}
+	if prepared.Err != nil {
+		return prepared.Err
+	}
+
+	output := prepared.Data
 	if chain := m.hookChain(session.Space, opSend); len(chain) > 0 {
 		ctx := m.newContext(session, opSend, false, false)
 		ctx.Name = prepared.Name
@@ -1347,15 +1369,18 @@ func (m *Module) writePrepared(session *Session, prepared preparedFrame) error {
 		ctx.Args = cloneMap(prepared.Args)
 		ctx.Output = append([]byte(nil), prepared.Data...)
 		m.callHookChain(ctx, chain)
+		if ctx.Output != nil {
+			output = append([]byte(nil), ctx.Output...)
+		}
 	}
 
 	cfg := m.configSnapshot()
-	if err := m.writeFrame(session, m.frameType(), prepared.Data, cfg.WriteTimeout); err != nil {
+	if err := m.writeFrame(session, m.frameType(), output, cfg.WriteTimeout); err != nil {
 		m.stats.sendFailed.Add(1)
 		return err
 	}
 	m.stats.sent.Add(1)
-	m.stats.bytesSent.Add(int64(len(prepared.Data)))
+	m.stats.bytesSent.Add(int64(len(output)))
 	return nil
 }
 
@@ -1363,22 +1388,42 @@ func (m *Module) shutdownSession(session *Session) {
 	if session == nil {
 		return
 	}
+	cleanup := false
 	session.cleanup.Do(func() {
-		_ = session.close()
-		m.unregisterSession(session)
+		cleanup = true
 	})
+	if !cleanup {
+		return
+	}
+	session.closing.Store(true)
+	m.notifyClose(session, 0, nil, nil)
+	if session.activeWrites.Load() > 0 {
+		go m.finishShutdownSession(session, m.configSnapshot().WriteTimeout)
+		return
+	}
+	m.finishShutdownSession(session, m.configSnapshot().WriteTimeout)
+}
+
+func (m *Module) finishShutdownSession(session *Session, timeout time.Duration) {
+	if session == nil {
+		return
+	}
+	m.waitActiveWrites(session, timeout)
+	_ = session.close()
+	m.unregisterSession(session)
 }
 
 func (m *Module) waitQueueDrain(session *Session, timeout time.Duration) {
-	if session == nil || session.sendQueue == nil {
+	if session == nil {
 		return
 	}
-	if len(session.sendQueue) == 0 {
+	if session.sendQueue == nil {
+		m.waitActiveWrites(session, timeout)
 		return
 	}
 	if session.drainReady == nil {
 		deadline := time.Now().Add(timeout)
-		for len(session.sendQueue) > 0 {
+		for session.pendingWrites.Load() > 0 {
 			if timeout > 0 && time.Now().After(deadline) {
 				return
 			}
@@ -1389,22 +1434,27 @@ func (m *Module) waitQueueDrain(session *Session, timeout time.Duration) {
 				time.Sleep(time.Millisecond)
 			}
 		}
+		m.waitActiveWrites(session, remainingTimeout(deadline, timeout))
 		return
 	}
 	if timeout <= 0 {
-		for len(session.sendQueue) > 0 {
+		for session.pendingWrites.Load() > 0 {
 			select {
 			case <-session.closed:
 				return
 			case <-session.drainReady:
+			default:
+				time.Sleep(time.Millisecond)
 			}
 		}
+		m.waitActiveWrites(session, 0)
 		return
 	}
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	for len(session.sendQueue) > 0 {
+	deadline := time.Now().Add(timeout)
+	for session.pendingWrites.Load() > 0 {
 		select {
 		case <-session.closed:
 			return
@@ -1413,6 +1463,51 @@ func (m *Module) waitQueueDrain(session *Session, timeout time.Duration) {
 			return
 		}
 	}
+	m.waitActiveWrites(session, remainingTimeout(deadline, timeout))
+}
+
+func (m *Module) waitActiveWrites(session *Session, timeout time.Duration) {
+	if session == nil {
+		return
+	}
+	if session.activeWrites.Load() <= 0 {
+		return
+	}
+	if timeout <= 0 {
+		for session.activeWrites.Load() > 0 {
+			select {
+			case <-session.closed:
+				return
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
+		return
+	}
+
+	deadline := time.Now().Add(timeout)
+	for session.activeWrites.Load() > 0 {
+		if time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-session.closed:
+			return
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func remainingTimeout(deadline time.Time, original time.Duration) time.Duration {
+	if original <= 0 {
+		return original
+	}
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
 }
 
 func (m *Module) registerSession(session *Session) {
@@ -1448,7 +1543,7 @@ func (m *Module) unregisterSession(session *Session) {
 	if session == nil {
 		return
 	}
-	session.Space = normalizeSpace(session.Space)
+	space := normalizeSpace(session.Space)
 
 	m.leaveAll(session)
 
@@ -1458,7 +1553,7 @@ func (m *Module) unregisterSession(session *Session) {
 		return
 	}
 	if uid := strings.TrimSpace(session.User); uid != "" {
-		if spaceUsers, ok := m.users[session.Space]; ok {
+		if spaceUsers, ok := m.users[space]; ok {
 			if members, ok := spaceUsers[uid]; ok {
 				delete(members, session.ID)
 				if len(members) == 0 {
@@ -1467,14 +1562,14 @@ func (m *Module) unregisterSession(session *Session) {
 				}
 			}
 			if len(spaceUsers) == 0 {
-				delete(m.users, session.Space)
+				delete(m.users, space)
 			}
 		}
 	}
-	if spaceSessions, ok := m.bySpace[session.Space]; ok {
+	if spaceSessions, ok := m.bySpace[space]; ok {
 		delete(spaceSessions, session.ID)
 		if len(spaceSessions) == 0 {
-			delete(m.bySpace, session.Space)
+			delete(m.bySpace, space)
 		}
 	}
 	delete(m.sessions, session.ID)
@@ -1486,13 +1581,13 @@ func (m *Module) leaveAll(session *Session) {
 	if session == nil {
 		return
 	}
-	session.Space = normalizeSpace(session.Space)
+	space := normalizeSpace(session.Space)
 
 	m.sessionMutex.Lock()
 	defer m.sessionMutex.Unlock()
 
 	for gid := range session.Groups {
-		if spaceGroups, ok := m.groups[session.Space]; ok {
+		if spaceGroups, ok := m.groups[space]; ok {
 			if members, ok := spaceGroups[gid]; ok {
 				delete(members, session.ID)
 				if len(members) == 0 {
@@ -1500,7 +1595,7 @@ func (m *Module) leaveAll(session *Session) {
 				}
 			}
 			if len(spaceGroups) == 0 {
-				delete(m.groups, session.Space)
+				delete(m.groups, space)
 			}
 		}
 		delete(session.Groups, gid)
@@ -1511,7 +1606,7 @@ func (m *Module) join(session *Session, gid string) {
 	if session == nil {
 		return
 	}
-	session.Space = normalizeSpace(session.Space)
+	space := normalizeSpace(session.Space)
 
 	gid = normalizeGroup(gid)
 	if gid == "" {
@@ -1521,13 +1616,13 @@ func (m *Module) join(session *Session, gid string) {
 	m.sessionMutex.Lock()
 	defer m.sessionMutex.Unlock()
 
-	if _, ok := m.groups[session.Space]; !ok {
-		m.groups[session.Space] = make(map[string]map[string]*Session)
+	if _, ok := m.groups[space]; !ok {
+		m.groups[space] = make(map[string]map[string]*Session)
 	}
-	if _, ok := m.groups[session.Space][gid]; !ok {
-		m.groups[session.Space][gid] = make(map[string]*Session)
+	if _, ok := m.groups[space][gid]; !ok {
+		m.groups[space][gid] = make(map[string]*Session)
 	}
-	m.groups[session.Space][gid][session.ID] = session
+	m.groups[space][gid][session.ID] = session
 	session.Groups[gid] = true
 }
 
@@ -1535,7 +1630,7 @@ func (m *Module) leave(session *Session, gid string) {
 	if session == nil {
 		return
 	}
-	session.Space = normalizeSpace(session.Space)
+	space := normalizeSpace(session.Space)
 
 	gid = normalizeGroup(gid)
 	if gid == "" {
@@ -1545,7 +1640,7 @@ func (m *Module) leave(session *Session, gid string) {
 	m.sessionMutex.Lock()
 	defer m.sessionMutex.Unlock()
 
-	if spaceGroups, ok := m.groups[session.Space]; ok {
+	if spaceGroups, ok := m.groups[space]; ok {
 		if members, ok := spaceGroups[gid]; ok {
 			delete(members, session.ID)
 			if len(members) == 0 {
@@ -1553,7 +1648,7 @@ func (m *Module) leave(session *Session, gid string) {
 			}
 		}
 		if len(spaceGroups) == 0 {
-			delete(m.groups, session.Space)
+			delete(m.groups, space)
 		}
 	}
 	delete(session.Groups, gid)
@@ -1563,7 +1658,7 @@ func (m *Module) bindUser(session *Session, uid string) {
 	if session == nil {
 		return
 	}
-	session.Space = normalizeSpace(session.Space)
+	space := normalizeSpace(session.Space)
 
 	uid = strings.TrimSpace(uid)
 
@@ -1571,7 +1666,7 @@ func (m *Module) bindUser(session *Session, uid string) {
 	defer m.sessionMutex.Unlock()
 
 	if current := strings.TrimSpace(session.User); current != "" {
-		if spaceUsers, ok := m.users[session.Space]; ok {
+		if spaceUsers, ok := m.users[space]; ok {
 			if members, ok := spaceUsers[current]; ok {
 				delete(members, session.ID)
 				if len(members) == 0 {
@@ -1580,7 +1675,7 @@ func (m *Module) bindUser(session *Session, uid string) {
 				}
 			}
 			if len(spaceUsers) == 0 {
-				delete(m.users, session.Space)
+				delete(m.users, space)
 			}
 		}
 	}
@@ -1589,14 +1684,14 @@ func (m *Module) bindUser(session *Session, uid string) {
 	if uid == "" {
 		return
 	}
-	if _, ok := m.users[session.Space]; !ok {
-		m.users[session.Space] = make(map[string]map[string]*Session)
+	if _, ok := m.users[space]; !ok {
+		m.users[space] = make(map[string]map[string]*Session)
 	}
-	if _, ok := m.users[session.Space][uid]; !ok {
-		m.users[session.Space][uid] = make(map[string]*Session)
+	if _, ok := m.users[space][uid]; !ok {
+		m.users[space][uid] = make(map[string]*Session)
 		m.stats.users.Add(1)
 	}
-	m.users[session.Space][uid][session.ID] = session
+	m.users[space][uid][session.ID] = session
 }
 
 func (m *Module) sessionGroups(session *Session) []string {
@@ -1754,9 +1849,47 @@ func (m *Module) hookChain(space, op string) []ctxFunc {
 func (m *Module) callHookChain(ctx *Context, chain []ctxFunc) {
 	for _, fn := range chain {
 		if fn != nil {
-			fn(ctx)
+			m.callContextFunc(ctx, fn)
 		}
 	}
+}
+
+func (m *Module) callContextFunc(ctx *Context, fn ctxFunc) {
+	if fn == nil {
+		return
+	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			if ctx != nil {
+				ctx.Error(infra.Fail.With("ws panic: %v", rec))
+			}
+			log.Errorw("ws.context.panic", Map{
+				"panic": fmt.Sprint(rec),
+			})
+		}
+	}()
+	fn(ctx)
+}
+
+func (m *Module) notifyClose(session *Session, messageType int, payload []byte, err error) {
+	if session == nil {
+		return
+	}
+	session.closeHookOnce.Do(func() {
+		chain := m.hookChain(session.Space, opClose)
+		if len(chain) == 0 {
+			return
+		}
+		closeCtx := m.newContext(session, opClose, true, true)
+		closeCtx.Type = messageType
+		if len(payload) > 0 {
+			closeCtx.Input = append([]byte(nil), payload...)
+		}
+		if err != nil {
+			closeCtx.Error(infra.Fail.With(err.Error()))
+		}
+		m.callHookChain(closeCtx, chain)
+	})
 }
 
 func (m *Module) message(space, name string) (Message, bool) {
@@ -2056,15 +2189,37 @@ func registerInternalMessages() {
 			msg, _ := ctx.Value["msg"].(string)
 			args := toMap(ctx.Value["args"])
 			result := Delivery{}
-			switch strings.TrimSpace(strings.ToLower(op)) {
+			op = strings.TrimSpace(strings.ToLower(op))
+			msg = strings.TrimSpace(strings.ToLower(msg))
+			if msg == "" {
+				return infra.Invalid.With("invalid ws dispatch message")
+			}
+			switch op {
 			case dispatchPush:
+				sid = strings.TrimSpace(sid)
+				if sid == "" {
+					return infra.Invalid.With("invalid ws dispatch sid")
+				}
+				if module.sessionByID(sid) == nil {
+					return infra.OK
+				}
 				result = module.deliverSession(ctx.Meta, sid, msg, args)
 			case dispatchPushUser:
+				uid = strings.TrimSpace(uid)
+				if uid == "" {
+					return infra.Invalid.With("invalid ws dispatch uid")
+				}
 				result = module.deliverUser(ctx.Meta, space, uid, msg, args)
 			case dispatchGroupcast:
+				gid = strings.TrimSpace(gid)
+				if gid == "" {
+					return infra.Invalid.With("invalid ws dispatch gid")
+				}
 				result = module.deliverGroup(ctx.Meta, space, gid, msg, args)
-			default:
+			case dispatchBroadcast:
 				result = module.deliverBroadcast(ctx.Meta, space, msg, args)
+			default:
+				return infra.Invalid.With("invalid ws dispatch op: %s", op)
 			}
 			if result.FirstError != "" {
 				return infra.Fail.With(result.FirstError)
@@ -2350,14 +2505,6 @@ func (m *Module) marshalFrame(value Any) ([]byte, error) {
 	return infra.Marshal(codec, value)
 }
 
-func (m *Module) unmarshalFrame(data []byte, value Any) error {
-	codec := m.frameCodec()
-	if codec == infra.JSON {
-		return json.Unmarshal(data, value)
-	}
-	return infra.Unmarshal(codec, data, value)
-}
-
 func (m *Module) unmarshalFrameMap(data []byte) (Map, error) {
 	codec := m.frameCodec()
 	if codec == infra.JSON {
@@ -2429,8 +2576,14 @@ func (m *Module) parseIncomingFrame(frame Map) (string, Map) {
 			continue
 		}
 		if value, ok := frame[key]; ok {
+			if value == nil {
+				return name, Map{}
+			}
 			if mapped := anyToMap(value); len(mapped) > 0 {
 				return name, mapped
+			}
+			if rv := reflect.ValueOf(value); rv.IsValid() && rv.Kind() == reflect.Map {
+				return name, Map{}
 			}
 			return name, Map{key: value}
 		}
@@ -2710,34 +2863,6 @@ func orderedSpaceValues[T any](items map[string]map[string]T) map[string][]T {
 	for space, values := range items {
 		out[space] = orderedValues(values)
 	}
-	return out
-}
-
-func appendSpaceValues[T any](items map[string][]T, space string) []T {
-	space = normalizeSpace(space)
-	base := items[infra.DEFAULT]
-	if space == infra.DEFAULT {
-		out := make([]T, len(base))
-		copy(out, base)
-		return out
-	}
-	curr := items[space]
-	out := make([]T, 0, len(base)+len(curr))
-	out = append(out, base...)
-	out = append(out, curr...)
-	return out
-}
-
-func pickHandlerValues(items map[string][]Handler, space string) []Handler {
-	space = normalizeSpace(space)
-	if handlers := items[space]; len(handlers) > 0 {
-		out := make([]Handler, len(handlers))
-		copy(out, handlers)
-		return out
-	}
-	handlers := items[infra.DEFAULT]
-	out := make([]Handler, len(handlers))
-	copy(out, handlers)
 	return out
 }
 
